@@ -56,6 +56,8 @@ class BoundedQueue {
 public:
     // You have to pass the memory for storing items at creation.
     // The queue contains at most memsize/sizeof(T) items.
+
+	// 传入地址作为缓冲区的起始地址，memsize为缓冲区总大小
     BoundedQueue(void* mem, size_t memsize, StorageOwnership ownership)
         : _count(0)
         , _cap(memsize / sizeof(T))
@@ -95,6 +97,8 @@ public:
 
     // Push |item| into bottom side of this queue.
     // Returns true on success, false if queue is full.
+    // 追加元素
+    // new T1 T2() new placement
     bool push(const T& item) {
         if (_count < _cap) {
             new ((T*)_items + _mod(_start + _count, _cap)) T(item);

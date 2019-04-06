@@ -204,7 +204,11 @@ int Channel::Init(const char* server_addr_and_port,
                   const ChannelOptions* options) {
     GlobalInitializeOrDie();
     butil::EndPoint point;
+
+	// 获取用户指定的协议名
     const AdaptiveProtocolType& ptype = (options ? options->protocol : _options.protocol);
+
+	// 根据协议名找到对应的协议
     const Protocol* protocol = FindProtocol(ptype);
     if (protocol == NULL || !protocol->support_client()) {
         LOG(ERROR) << "Channel does not support the protocol";
@@ -235,6 +239,7 @@ int Channel::Init(const char* server_addr_and_port,
 
 int Channel::Init(const char* server_addr, int port,
                   const ChannelOptions* options) {
+    // 初始化协议数组
     GlobalInitializeOrDie();
     butil::EndPoint point;
     const AdaptiveProtocolType& ptype = (options ? options->protocol : _options.protocol);
@@ -306,6 +311,7 @@ int Channel::InitSingle(const butil::EndPoint& server_addr_and_port,
     if (CreateSocketSSLContext(_options, &ssl_ctx) != 0) {
         return -1;
     }
+	// 创建Socket并保存到socket_map中，同时将fd存到EPOLL调度器
     if (SocketMapInsert(SocketMapKey(server_addr_and_port, sig),
                         &_server_id, ssl_ctx) != 0) {
         LOG(ERROR) << "Fail to insert into SocketMap";
@@ -363,14 +369,22 @@ static void HandleBackupRequest(void* arg) {
     bthread_id_error(correlation_id, EBACKUPREQUEST);
 }
 
+// 由Stub调用
+// method: 传入对应方法函数的描述信息
+// controller_base: 由调用者创建，流程控制，代表一个单独的函数调用
+// request: 由调用者创建，只读，实际请求
+// response: 调用者创建，只写，保存收到的响应
+// done: 用于异步操作的完成
 void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
                          google::protobuf::RpcController* controller_base,
                          const google::protobuf::Message* request,
                          google::protobuf::Message* response,
                          google::protobuf::Closure* done) {
+    // 记录调用方法的时间
     const int64_t start_send_real_us = butil::gettimeofday_us();
-    Controller* cntl = static_cast<Controller*>(controller_base);
-    cntl->OnRPCBegin(start_send_real_us);
+	Controller* cntl = static_cast<Controller*>(controller_base);
+	// 设置调用的起始时间
+	cntl->OnRPCBegin(start_send_real_us);
     // Override max_retry first to reset the range of correlation_id
     if (cntl->max_retry() == UNSET_MAGIC_NUM) {
         cntl->set_max_retry(_options.max_retry);
@@ -476,6 +490,8 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         // parameters in `cntl' are set.
         return cntl->HandleSendFailed();
     }
+
+	// protocol实现的函数，将请求序列化到IO::buf
     _serialize_request(&cntl->_request_buf, cntl, request);
     if (cntl->FailedInline()) {
         return cntl->HandleSendFailed();

@@ -55,6 +55,8 @@ enum EmptyFieldAction {
 };
 
 // Split a string with one character
+
+// 拆分一个字符串
 class StringSplitter {
 public:
     // Split `input' with `separator'. If `action' is SKIP_EMPTY_FIELD, zero-

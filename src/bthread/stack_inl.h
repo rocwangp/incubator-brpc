@@ -43,7 +43,8 @@ struct LargeStackClass {
     static const int stacktype = (int)STACK_TYPE_LARGE;
 };
 
-template <typename StackClass> struct StackFactory {
+template <typename StackClass> 
+struct StackFactory {
     struct Wrapper : public ContextualStack {
         explicit Wrapper(void (*entry)(intptr_t)) {
             if (allocate_stack_storage(&storage, *StackClass::stack_size_flag,
@@ -125,6 +126,7 @@ inline void return_stack(ContextualStack* s) {
     }
 }
 
+// 上下文切换
 inline void jump_stack(ContextualStack* from, ContextualStack* to) {
     bthread_jump_fcontext(&from->context, to->context, 0/*not skip remained*/);
 }

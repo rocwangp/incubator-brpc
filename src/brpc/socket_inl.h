@@ -118,6 +118,7 @@ inline int Socket::Dereference() {
     return -1;
 }
 
+// 根据socket id找到socket address
 inline int Socket::Address(SocketId id, SocketUniquePtr* ptr) {
     const butil::ResourceId<Socket> slot = SlotOfSocketId(id);
     Socket* const m = address_resource(slot);

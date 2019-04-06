@@ -52,6 +52,7 @@ void run_worker_startfn() {
     }
 }
 
+// 工作线程入口
 void* TaskControl::worker_thread(void* arg) {
     run_worker_startfn();    
 #ifdef BAIDU_INTERNAL
@@ -59,6 +60,7 @@ void* TaskControl::worker_thread(void* arg) {
 #endif
     
     TaskControl* c = static_cast<TaskControl*>(arg);
+	// 创建该线程上的TaskGroup，管理该线程上的所有任务(协程)
     TaskGroup* g = c->create_group();
     TaskStatistics stat;
     if (NULL == g) {
@@ -70,6 +72,7 @@ void* TaskControl::worker_thread(void* arg) {
 
     tls_task_group = g;
     c->_nworkers << 1;
+	// 工作线程执行入口
     g->run_main_task();
 
     stat = g->main_stat();
@@ -140,6 +143,8 @@ TaskControl::TaskControl()
     CHECK(_groups) << "Fail to create array of groups";
 }
 
+// 一个TaskControl代表一个工作线程池，每个线程包含一个TaskGroup
+// 每个TaskGroup代表一个N:1协程模型，使用上下文切换进行调度
 int TaskControl::init(int concurrency) {
     if (_concurrency != 0) {
         LOG(ERROR) << "Already initialized";
@@ -158,6 +163,7 @@ int TaskControl::init(int concurrency) {
     }
     
     _workers.resize(_concurrency);   
+	// 创建concurrency个工作线程，每个线程运行着若干个协程
     for (int i = 0; i < _concurrency; ++i) {
         const int rc = pthread_create(&_workers[i], NULL, worker_thread, this);
         if (rc) {
@@ -329,6 +335,7 @@ int TaskControl::_destroy_group(TaskGroup* g) {
     return 0;
 }
 
+// 选择一个任务去执行
 bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
     // 1: Acquiring fence is paired with releasing fence in _add_group to
     // avoid accessing uninitialized slot of _groups.
@@ -337,8 +344,11 @@ bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
         return false;
     }
 
+
     // NOTE: Don't return inside `for' iteration since we need to update |seed|
-    bool stolen = false;
+
+	// 先从自己的rq中选择任务执行，没有的话从其他TaskGroup::rq中选择
+	bool stolen = false;
     size_t s = *seed;
     for (size_t i = 0; i < ngroup; ++i, s += offset) {
         TaskGroup* g = _groups[s % ngroup];

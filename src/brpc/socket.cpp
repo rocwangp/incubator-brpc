@@ -40,6 +40,8 @@
 #include "brpc/errno.pb.h"
 #include "brpc/event_dispatcher.h"          // RemoveConsumer
 #include "brpc/socket.h"
+
+
 #include "brpc/describable.h"               // Describable
 #include "brpc/circuit_breaker.h"           // CircuitBreaker
 #include "brpc/input_messenger.h"
@@ -535,6 +537,7 @@ void Socket::ReleaseAllFailedWriteRequests(Socket::WriteRequest* req) {
     ReturnFailedWriteRequest(req, error_code, error_text);
 }
 
+// 设置套接字fd的属性，并添加到epoll中
 int Socket::ResetFileDescriptor(int fd) {
     // Reset message sizes when fd is changed.
     _last_msg_size = 0;
@@ -543,6 +546,8 @@ int Socket::ResetFileDescriptor(int fd) {
     // race conditions with the callback function inside epoll
     _fd.store(fd, butil::memory_order_release);
     _reset_fd_real_us = butil::gettimeofday_us();
+
+	// 判断是否是一个有效的文件描述符，大小在[0: INT_MAX]之间
     if (!ValidFileDescriptor(fd)) {
         return 0;
     }
@@ -554,21 +559,26 @@ int Socket::ResetFileDescriptor(int fd) {
     // FIXME : close-on-exec should be set by new syscalls or worse: set right
     // after fd-creation syscall. Setting at here has higher probabilities of
     // race condition.
+
+	// CLOSE-ON-EXEC
     butil::make_close_on_exec(fd);
 
     // Make the fd non-blocking.
+    // 非阻塞
     if (butil::make_non_blocking(fd) != 0) {
         PLOG(ERROR) << "Fail to set fd=" << fd << " to non-blocking";
         return -1;
     }
     // turn off nagling.
     // OK to fail, namely unix domain socket does not support this.
+    // NO-DELAY 关闭nagling算法
     butil::make_no_delay(fd);
     if (_tos > 0 &&
         setsockopt(fd, IPPROTO_IP, IP_TOS, &_tos, sizeof(_tos)) < 0) {
         PLOG(FATAL) << "Fail to set tos of fd=" << fd << " to " << _tos;
     }
 
+	// 设置发送缓冲区大小
     if (FLAGS_socket_send_buffer_size > 0) {
         int buff_size = FLAGS_socket_send_buffer_size;
         socklen_t size = sizeof(buff_size);
@@ -578,6 +588,7 @@ int Socket::ResetFileDescriptor(int fd) {
         }
     }
 
+	// 设置接收缓冲区大小
     if (FLAGS_socket_recv_buffer_size > 0) {
         int buff_size = FLAGS_socket_recv_buffer_size;
         socklen_t size = sizeof(buff_size);
@@ -587,6 +598,7 @@ int Socket::ResetFileDescriptor(int fd) {
         }
     }
 
+	// 将fd添加到EPOLL中
     if (_on_edge_triggered_events) {
         if (GetGlobalEventDispatcher(fd).AddConsumer(id(), fd) != 0) {
             PLOG(ERROR) << "Fail to add SocketId=" << id() 
@@ -601,8 +613,11 @@ int Socket::ResetFileDescriptor(int fd) {
 // SocketId = 32-bit version + 32-bit slot.
 //   version: from version part of _versioned_nref, must be an EVEN number.
 //   slot: designated by ResourcePool.
+
+// 根据options创建Socket对象，返回对象id
 int Socket::Create(const SocketOptions& options, SocketId* id) {
     butil::ResourceId<Socket> slot;
+	// 从对象池中创建一个socket
     Socket* const m = butil::get_resource(&slot, Forbidden());
     if (m == NULL) {
         LOG(FATAL) << "Fail to get_resource<Socket>";
@@ -614,7 +629,9 @@ int Socket::Create(const SocketOptions& options, SocketId* id) {
     m->_keytable_pool = options.keytable_pool;
     m->_tos = 0;
     m->_remote_side = options.remote_side;
+	// epoll事件的回调函数
     m->_on_edge_triggered_events = options.on_edge_triggered_events;
+	// Socket所属的对象，如Acceptor
     m->_user = options.user;
     m->_conn = options.conn;
     m->_app_connect = options.app_connect;
@@ -667,6 +684,7 @@ int Socket::Create(const SocketOptions& options, SocketId* id) {
     CHECK(NULL == m->_write_head.load(butil::memory_order_relaxed));
     // Must be last one! Internal fields of this Socket may be access
     // just after calling ResetFileDescriptor.
+    // 将套接字fd添加到EPOLL中
     if (m->ResetFileDescriptor(options.fd) != 0) {
         const int saved_errno = errno;
         PLOG(ERROR) << "Fail to ResetFileDescriptor";
@@ -1198,6 +1216,7 @@ int Socket::WaitEpollOut(int fd, bool pollin, const timespec* abstime) {
     return rc;
 }
 
+// 非阻塞连接
 int Socket::Connect(const timespec* abstime,
                     int (*on_connect)(int, int, void*), void* data) {
     if (_ssl_ctx) {
@@ -1205,11 +1224,14 @@ int Socket::Connect(const timespec* abstime,
     } else {
         _ssl_state = SSL_OFF;
     }
+
+	// 创建socket fd
     butil::fd_guard sockfd(socket(AF_INET, SOCK_STREAM, 0));
     if (sockfd < 0) {
         PLOG(ERROR) << "Fail to create socket";
         return -1;
     }
+	// 设置非阻塞
     CHECK_EQ(0, butil::make_close_on_exec(sockfd));
     // We need to do async connect (to manage the timeout by ourselves).
     CHECK_EQ(0, butil::make_non_blocking(sockfd));
@@ -1220,6 +1242,8 @@ int Socket::Connect(const timespec* abstime,
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr = remote_side().ip;
     serv_addr.sin_port = htons(remote_side().port);
+
+	// 非阻塞connect
     const int rc = ::connect(
         sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
     if (rc != 0 && errno != EINPROGRESS) {
@@ -1227,11 +1251,13 @@ int Socket::Connect(const timespec* abstime,
         return -1;
     }
     if (on_connect) {
+		// 当连接建立或者出错，fd会变为可读，所以监听可读事件
         EpollOutRequest* req = new(std::nothrow) EpollOutRequest;
         if (req == NULL) {
             LOG(FATAL) << "Fail to new EpollOutRequest";
             return -1;
         }
+		// 保存连接完成时的回调
         req->fd = sockfd;
         req->timer_id = 0;
         req->on_epollout_event = on_connect;
@@ -1241,6 +1267,7 @@ int Socket::Connect(const timespec* abstime,
         SocketId connect_id;
         SocketOptions options;
         options.user = req;
+		// 创建一个Socket对象
         if (Socket::Create(options, &connect_id) != 0) {
             LOG(FATAL) << "Fail to create Socket";
             delete req;
@@ -1254,6 +1281,8 @@ int Socket::Connect(const timespec* abstime,
 
         // Add `sockfd' into epoll so that `HandleEpollOutRequest' will
         // be called with `req' when epoll event reaches
+
+		// 将sockfd添加到EPOLL中
         if (GetGlobalEventDispatcher(sockfd).
             AddEpollOut(connect_id, sockfd, false) != 0) {
             const int saved_errno = errno;
@@ -1269,6 +1298,7 @@ int Socket::Connect(const timespec* abstime,
         // It also work when `HandleEpollOutRequest' has already been
         // called before adding the timer since it will be removed
         // inside destructor of `EpollOutRequest' after leaving this scope
+        // 设置连接超时定时器
         if (abstime) {
             int rc = bthread_timer_add(&req->timer_id, *abstime,
                                        HandleEpollOutTimeout,
@@ -1322,12 +1352,15 @@ int Socket::CheckConnected(int sockfd) {
     return SSLHandshake(sockfd, false);
 }
 
+// 如果没有建立连接(通常是刚创建Socket对象时)，建立连接
 int Socket::ConnectIfNot(const timespec* abstime, WriteRequest* req) {
+	// Socket是从对象池中建立的，只是创建了对象本身，没有创建fd
     if (_fd.load(butil::memory_order_consume) >= 0) {
        return 0;
     }
 
     // Have to hold a reference for `req'
+    // 根据当前Socket对象创建SocketUniquePtr
     SocketUniquePtr s;
     ReAddress(&s);
     req->socket = s.get();
@@ -1336,6 +1369,7 @@ int Socket::ConnectIfNot(const timespec* abstime, WriteRequest* req) {
             return -1;
         }
     } else {
+    	// 非阻塞连接，连接完成时调用KeepWriteIfConnected
         if (Connect(abstime, KeepWriteIfConnected, req) < 0) {
             return -1;
         }
@@ -1394,6 +1428,7 @@ int Socket::HandleEpollOutRequest(int error_code, EpollOutRequest* req) {
     return req->on_epollout_event(req->fd, error_code, req->data);
 }
 
+// 创建后台协程，发送数据
 void Socket::AfterAppConnected(int err, void* data) {
     WriteRequest* req = static_cast<WriteRequest*>(data);
     if (err == 0) {
@@ -1437,6 +1472,7 @@ static void* RunClosure(void* arg) {
     return NULL;
 }
 
+// connect之后fd可读时的回调函数
 int Socket::KeepWriteIfConnected(int fd, int err, void* data) {
     WriteRequest* req = static_cast<WriteRequest*>(data);
     Socket* s = req->socket;
@@ -1458,6 +1494,7 @@ int Socket::KeepWriteIfConnected(int fd, int err, void* data) {
     return 0;
 }
 
+// 如果连接成功，尝试发送数据
 void Socket::CheckConnectedAndKeepWrite(int fd, int err, void* data) {
     butil::fd_guard sockfd(fd);
     WriteRequest* req = static_cast<WriteRequest*>(data);
@@ -1518,6 +1555,7 @@ X509* Socket::GetPeerCertificate() const {
     return SSL_get_peer_certificate(_ssl_session);
 }
 
+// 将buf中的数据发送到对端
 int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
     WriteOptions opt;
     if (options_in) {
@@ -1542,6 +1580,7 @@ int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
         return SetError(opt.id_wait, EOVERCROWDED);
     }
 
+	// 将io buf包装为WriteRequest
     WriteRequest* req = butil::get_object<WriteRequest>();
     if (!req) {
         return SetError(opt.id_wait, ENOMEM);
@@ -1615,6 +1654,8 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     req->next = NULL;
     
     // Connect to remote_side() if not.
+    // 如果socket连接没有建立，先去建立连接，此后发送消息的流程在连接完成后进行
+    // 如果已经建立连接，则直接发送消息
     int ret = ConnectIfNot(opt.abstime, req);
     if (ret < 0) {
         saved_errno = errno;
@@ -1684,6 +1725,7 @@ FAIL_TO_WRITE:
 
 static const size_t DATA_LIST_MAX = 256;
 
+// 发送数据的后台协程
 void* Socket::KeepWrite(void* void_arg) {
     s_vars->nkeepwrite << 1;
     WriteRequest* req = static_cast<WriteRequest*>(void_arg);
@@ -1764,6 +1806,8 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
     // Group butil::IOBuf in the list into a batch array.
     butil::IOBuf* data_list[DATA_LIST_MAX];
     size_t ndata = 0;
+
+	// 将req中的data拼装到IOBUF中
     for (WriteRequest* p = req; p != NULL && ndata < DATA_LIST_MAX;
          p = p->next) {
         data_list[ndata++] = &p->data;
@@ -1894,7 +1938,9 @@ int Socket::SSLHandshake(int fd, bool server_mode) {
     }
 }
 
+// 从fd中读取指定大小的数据
 ssize_t Socket::DoRead(size_t size_hint) {
+	// 如果SSL状态未设置，则尝试SSL握手
     if (ssl_state() == SSL_UNKNOWN) {
         int error_code = 0;
         _ssl_state = DetectSSLState(fd(), &error_code);
@@ -1923,6 +1969,7 @@ ssize_t Socket::DoRead(size_t size_hint) {
         }
     }
     // _ssl_state has been set
+    // 不是SSL连接，只是一个普通的TCP连接，直接读数据
     if (ssl_state() == SSL_OFF) {
         return _read_buf.append_from_file_descriptor(fd(), size_hint);
     }
@@ -2007,7 +2054,7 @@ AuthContext* Socket::mutable_auth_context() {
     }
     _auth_context = new(std::nothrow) AuthContext();
     CHECK(_auth_context);
-    return _auth_context;
+    return _auth_context
 }
 
 int Socket::StartInputEvent(SocketId id, uint32_t events,
@@ -2372,6 +2419,7 @@ inline SocketPool::~SocketPool() {
     }
 }
 
+// 从池子中选择一个socket赋值给ptr，如果池子是空的则创建一个socket
 inline int SocketPool::GetSocket(SocketUniquePtr* ptr) {
     const int connection_pool_size = FLAGS_max_connection_pool_size;
 
@@ -2393,16 +2441,21 @@ inline int SocketPool::GetSocket(SocketUniquePtr* ptr) {
     if (connection_pool_size > 0) {
         for (;;) {
             {
+            	// 池子是空，直接返回
                 BAIDU_SCOPED_LOCK(_mutex);
                 if (_pool.empty()) {
                     break;
                 }
+				// 弹出一个socket id
                 sid = _pool.back();
                 _pool.pop_back();
-            }
+            } 
+			// 空闲的socket减一
             _numfree.fetch_sub(1, butil::memory_order_relaxed);
             // Not address inside the lock since at most time the pooled socket
             // is likely to be valid.
+
+			// 根据socket id获取socket对象
             if (Socket::Address(sid, ptr) == 0) {
                 _numinflight.fetch_add(1, butil::memory_order_relaxed);
                 return 0;
@@ -2412,6 +2465,7 @@ inline int SocketPool::GetSocket(SocketUniquePtr* ptr) {
     // Not found in pool
     SocketOptions opt = _options;
     opt.health_check_interval_s = -1;
+	// 创建一个socket返回
     if (get_client_side_messenger()->Create(opt, &sid) == 0 &&
         Socket::Address(sid, ptr) == 0) {
         _numinflight.fetch_add(1, butil::memory_order_relaxed);
@@ -2420,6 +2474,7 @@ inline int SocketPool::GetSocket(SocketUniquePtr* ptr) {
     return -1;
 }
 
+// 将socket放回到pool中
 inline void SocketPool::ReturnSocket(Socket* sock) {
     // NOTE: save the gflag which may be reloaded at any time.
     const int connection_pool_size = FLAGS_max_connection_pool_size;
@@ -2479,6 +2534,7 @@ Socket::SharedPart* Socket::GetOrNewSharedPartSlower() {
     return shared_part;
 }
 
+// 共享SocketPool
 void Socket::ShareStats(Socket* main_socket) {
     SharedPart* main_sp = main_socket->GetOrNewSharedPart();
     main_sp->AddRefManually();
@@ -2489,17 +2545,20 @@ void Socket::ShareStats(Socket* main_socket) {
     }
 }
 
+// 获取一个和当前socket共享SocketPool的socket，如果没有则创建一个
 int Socket::GetPooledSocket(SocketUniquePtr* pooled_socket) {
     if (pooled_socket == NULL) {
         LOG(ERROR) << "pooled_socket is NULL";
         return -1;
     }
+	// 获取当前socket所属的SocketPool
     SharedPart* main_sp = GetOrNewSharedPart();
     if (main_sp == NULL) {
         LOG(ERROR) << "_shared_part is NULL";
         return -1;
     }
     // Create socket_pool optimistically.
+    // 如果当前socket没有所属的SocketPool，则创建一个
     SocketPool* socket_pool = main_sp->socket_pool.load(butil::memory_order_consume);
     if (socket_pool == NULL) {
         SocketOptions opt;
@@ -2518,9 +2577,12 @@ int Socket::GetPooledSocket(SocketUniquePtr* pooled_socket) {
             socket_pool = expected;
         }
     }
+	// 从Pool中取出一个Socket，如果没有就创建一个
     if (socket_pool->GetSocket(pooled_socket) != 0) {
         return -1;
     }
+	// 设置取出的socket和当前socket共享Pool
+	// 因为新创建的Socket没有设置SocketPool，所以在ShareStats中设置
     (*pooled_socket)->ShareStats(this);
     CHECK((*pooled_socket)->parsing_context() == NULL)
         << "context=" << (*pooled_socket)->parsing_context()
@@ -2529,6 +2591,8 @@ int Socket::GetPooledSocket(SocketUniquePtr* pooled_socket) {
     return 0;
 }
 
+// 将当前socket返回到SocketPool中
+// shared_part保存当前socket所属的那个Pool
 int Socket::ReturnToPool() {
     SharedPart* sp = _shared_part.exchange(NULL, butil::memory_order_acquire);
     if (sp == NULL) {
@@ -2556,6 +2620,7 @@ int Socket::ReturnToPool() {
     sp->RemoveRefManually();
     return 0;
 }
+
 
 bool Socket::HasSocketPool() const {
     SharedPart* sp = GetSharedPart();
@@ -2740,6 +2805,7 @@ SocketSSLContext::~SocketSSLContext() {
 
 } // namespace brpc
 
+#include "brpc/socket_inl.h"
 
 namespace std {
 ostream& operator<<(ostream& os, const brpc::Socket& sock) {

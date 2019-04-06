@@ -44,6 +44,7 @@ Acceptor::~Acceptor() {
     Join();
 }
 
+// 将监听套接字fd和一个Socket绑定
 int Acceptor::StartAccept(int listened_fd, int idle_timeout_sec,
                           const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
     if (listened_fd < 0) {
@@ -76,9 +77,11 @@ int Acceptor::StartAccept(int listened_fd, int idle_timeout_sec,
     // Creation of _acception_id is inside lock so that OnNewConnections
     // (which may run immediately) should see sane fields set below.
     SocketOptions options;
+	// 只有设置了fd，Socket::Create才会将其添加到EPOLL中，默认的Socket::Create不会
     options.fd = listened_fd;
     options.user = this;
     options.on_edge_triggered_events = OnNewConnections;
+	// 创建一个Socket对象，和监听套接字fd绑定
     if (Socket::Create(options, &_acception_id) != 0) {
         // Close-idle-socket thread will be stopped inside destructor
         LOG(FATAL) << "Fail to create _acception_id";
@@ -237,6 +240,7 @@ void Acceptor::ListConnections(std::vector<SocketId>* conn_list) {
     return ListConnections(conn_list, std::numeric_limits<size_t>::max());
 }
 
+// 接收连接
 void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
     while (1) {
         struct sockaddr in_addr;
@@ -263,7 +267,8 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
             acception->SetFailed(EINVAL, "Impossible! acception->user() MUST be Acceptor");
             return;
         }
-        
+
+		// 将接收到的fd和Socket对象绑定，添加到EPOLL中
         SocketId socket_id;
         SocketOptions options;
         options.keytable_pool = am->_keytable_pool;
@@ -311,6 +316,7 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
     }
 }
 
+// 当listen_fd可读时由epoll调用
 void Acceptor::OnNewConnections(Socket* acception) {
     int progress = Socket::PROGRESS_INIT;
     do {

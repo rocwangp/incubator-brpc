@@ -65,6 +65,7 @@ typedef void* bthread_fcontext_t;
 extern "C"{
 #endif
 
+// 汇编上下文切换
 intptr_t BTHREAD_CONTEXT_CALL_CONVENTION
 bthread_jump_fcontext(bthread_fcontext_t * ofc, bthread_fcontext_t nfc,
                       intptr_t vp, bool preserve_fpu = false);

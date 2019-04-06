@@ -27,6 +27,8 @@ namespace brpc {
 
 // Dispatch edge-triggered events of file descriptors to consumers
 // running in separate bthreads.
+
+// EPOLL调度器
 class EventDispatcher {
 friend class Socket;
 public:

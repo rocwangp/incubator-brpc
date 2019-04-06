@@ -61,9 +61,11 @@ public:
     }
 };
 
+// 创建全局的socket_map，保存所有的socket
 static void CreateClientSideSocketMap() {
     SocketMap* socket_map = new SocketMap;
     SocketMapOptions options;
+	// 设置创建socket的对象
     options.socket_creator = new GlobalSocketCreator;
     options.idle_timeout_second_dynamic = &FLAGS_idle_timeout_second;
     options.defer_close_second_dynamic = &FLAGS_defer_close_second;
@@ -79,6 +81,7 @@ SocketMap* get_client_side_socket_map() {
     // SocketMap.
     return g_socket_map.load(butil::memory_order_consume);
 }
+// 初始化全局socket_map
 SocketMap* get_or_new_client_side_socket_map() {
     get_or_new_client_side_messenger();
     pthread_once(&g_socket_map_init, CreateClientSideSocketMap);
@@ -208,9 +211,12 @@ void SocketMap::PrintSocketMap(std::ostream& os, void* arg) {
     static_cast<SocketMap*>(arg)->Print(os);
 }
 
+// 创建一个Socket对象插入到socket_map中，id赋值给*id
 int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
                       const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
     std::unique_lock<butil::Mutex> mu(_mutex);
+
+	// 如果对应的key已经存在，则删掉
     SingleConnection* sc = _map.seek(key);
     if (sc) {
         if (!sc->socket->Failed() ||
@@ -231,6 +237,8 @@ int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
     SocketOptions opt;
     opt.remote_side = key.peer.addr;
     opt.initial_ssl_ctx = ssl_ctx;
+
+	// 创建一个Socket对象，返回对象id
     if (_options.socket_creator->CreateSocket(opt, &tmp_id) != 0) {
         PLOG(FATAL) << "Fail to create socket to " << key.peer;
         return -1;
@@ -239,11 +247,13 @@ int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
     // use SocketUniquePtr which cannot put into containers before c++11.
     // The ref will be removed at entry's removal.
     SocketUniquePtr ptr;
+	// 根据socket id找到socket地址
     if (Socket::Address(tmp_id, &ptr) != 0) {
         LOG(FATAL) << "Fail to address SocketId=" << tmp_id;
         return -1;
     }
     SingleConnection new_sc = { 1, ptr.release(), 0 };
+	// 保存socket对象，用key做索引
     _map[key] = new_sc;
     *id = tmp_id;
     bool need_to_create_bvar = false;

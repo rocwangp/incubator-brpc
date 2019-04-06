@@ -575,6 +575,9 @@ void IOBuf::operator=(const IOBuf& rhs) {
 template <bool MOVE>
 void IOBuf::_push_or_move_back_ref_to_smallview(const BlockRef& r) {
     BlockRef* const refs = _sv.refs;
+
+	// 将BlockRef保存在refs[2]中
+	// 如果refs[0]为空，直接赋值(移动)
     if (NULL == refs[0].block) {
         refs[0] = r;
         if (!MOVE) {
@@ -583,6 +586,8 @@ void IOBuf::_push_or_move_back_ref_to_smallview(const BlockRef& r) {
         return;
     }
     if (NULL == refs[1].block) {
+		// 如果第二个为空，同时此时要加入的Block节点和refs[0]的一样并且是连续的
+		// 直接更新第一个refs[0]
         if (refs[0].block == r.block &&
             refs[0].offset + refs[0].length == r.offset) { // Merge ref
             refs[0].length += r.length;
@@ -591,12 +596,14 @@ void IOBuf::_push_or_move_back_ref_to_smallview(const BlockRef& r) {
             }
             return;
         }
+		// 如果不连续，保存在refs[1]中
         refs[1] = r;
         if (!MOVE) {
             r.block->inc_ref();
         }
         return;
     }
+	// 和第二个refs[1]连续，直接更新大小
     if (refs[1].block == r.block &&
         refs[1].offset + refs[1].length == r.offset) { // Merge ref
         refs[1].length += r.length;
@@ -605,20 +612,31 @@ void IOBuf::_push_or_move_back_ref_to_smallview(const BlockRef& r) {
         }
         return;
     }
+	// SmallView存不下，放到BigView中
     // Convert to BigView
     BlockRef* new_refs = iobuf::acquire_blockref_array();
+
+	// 将SmallView中的refs[2]拷贝到SmallView中
     new_refs[0] = refs[0];
     new_refs[1] = refs[1];
+	// 保存当前的BlockRef
     new_refs[2] = r;
+	// 计算数据大小
     const size_t new_nbytes = refs[0].length + refs[1].length + r.length;
     if (!MOVE) {
         r.block->inc_ref();
     }
+	// 设置magic，表示当前使用BigView
     _bv.magic = -1;
+	// 开始的ref索引
     _bv.start = 0;
+	// refs数组
     _bv.refs = new_refs;
+	// 已经使用的个数
     _bv.nref = 3;
+	// 数组元素个数
     _bv.cap_mask = INITIAL_CAP - 1;
+	// 已经保存的所有数据个数
     _bv.nbytes = new_nbytes;
 }
 // Explicitly initialize templates.
@@ -1571,15 +1589,22 @@ void IOPortal::clear() {
 
 const int MAX_APPEND_IOVEC = 64;
 
+// 从fd中读取max_count大小的数据
 ssize_t IOPortal::pappend_from_file_descriptor(
     int fd, off_t offset, size_t max_count) {
+    // 批量读
     iovec vec[MAX_APPEND_IOVEC];
     int nvec = 0;
     size_t space = 0;
+
+	// Block形成的链表，成员变量_block表示当前IOPortal中的Block链表头
     Block* prev_p = NULL;
     Block* p = _block;
     // Prepare at most MAX_APPEND_IOVEC blocks or space of blocks >= max_count
+
+	// 准备若干个iovec去保存要读取的数据，循环直到容量达到指定的读取大小(max_count)
     do {
+		// 如果当前节点为空，需要新建一个Block节点
         if (p == NULL) {
             p = iobuf::acquire_tls_block();
             if (BAIDU_UNLIKELY(!p)) {
@@ -1587,24 +1612,31 @@ ssize_t IOPortal::pappend_from_file_descriptor(
                 return -1;
             }
             if (prev_p != NULL) {
+				// 连接链表节点
                 prev_p->portal_next = p;
             } else {
+            	// 设置链表头
                 _block = p;
             }
         }
+		// 保存一个容器缓存
         vec[nvec].iov_base = p->data + p->size;
         vec[nvec].iov_len = std::min(p->left_space(), max_count - space);
+		// 容器空间增加
         space += vec[nvec].iov_len;
         ++nvec;
+		// space表示vec总共能容纳的字节大小，如果达到max_count就可以跳出了
         if (space >= max_count || nvec >= MAX_APPEND_IOVEC) {
             break;
         }
+		// 索引下一个Block节点，继续存储
         prev_p = p;
         p = p->portal_next;
     } while (1);
 
     ssize_t nr = 0;
     if (offset < 0) {
+		// 批量读，从fd中读取数据，保存在vec的前nvec个容器中
         nr = readv(fd, vec, nvec);
     } else {
         static iobuf::iov_function preadv_func = iobuf::get_preadv_func();
@@ -1617,13 +1649,25 @@ ssize_t IOPortal::pappend_from_file_descriptor(
         return nr;
     }
 
+	
     size_t total_len = nr;
+	// 将读到的数据保存在成员变量中
     do {
+		// len为当前block已经保存的数据大小
         const size_t len = std::min(total_len, _block->left_space());
         total_len -= len;
+		// 将已经有数据的block保存到BlockRef中，等待上层取走
+		// _block->size: offset
+		// len: length
+		// _block: Block*
         const IOBuf::BlockRef r = { _block->size, (uint32_t)len, _block };
         _push_back_ref(r);
+
+		// _block已经保存的数据个数增加len
+		// 之前_block->size没有修改，是为了作为偏移量使用
         _block->size += len;
+		// 当前_block已经满了(并且已经存放到BlockRef了)
+		// 链表头指向下一个block
         if (_block->full()) {
             Block* const saved_next = _block->portal_next;
             _block->dec_ref();  // _block may be deleted

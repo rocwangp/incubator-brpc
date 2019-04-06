@@ -57,8 +57,11 @@ inline void TaskGroup::exchange(TaskGroup** pg, bthread_t next_tid) {
 }
 
 inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
+	// 根据bthread id找到对应任务的元数据TaskMeta
     TaskMeta* next_meta = address_meta(next_tid);
+	// 如果对应任务没有协程栈，为其创建一个
     if (next_meta->stack == NULL) {
+		// task_runner为协程函数入口，已写入到协程栈中
         ContextualStack* stk = get_stack(next_meta->stack_type(), task_runner);
         if (stk) {
             next_meta->set_stack(stk);
@@ -72,6 +75,7 @@ inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
         }
     }
     // Update now_ns only when wait_task did yield.
+    // 切换到对应的任务
     sched_to(pg, next_meta);
 }
 

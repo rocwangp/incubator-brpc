@@ -211,6 +211,7 @@ TimerThread::Bucket::schedule(void (*fn)(void*), void* arg,
     return result;
 }
 
+// 注册一个超时任务，如果注册的任务更早超时，则唤醒timer线程
 TimerThread::TaskId TimerThread::schedule(
     void (*fn)(void*), void* arg, const timespec& abstime) {
     if (_stop.load(butil::memory_order_relaxed) || !_started) {
@@ -218,9 +219,11 @@ TimerThread::TaskId TimerThread::schedule(
         return INVALID_TASK_ID;
     }
     // Hashing by pthread id is better for cache locality.
+    // 为当前任务选择一个bucket保存
     const Bucket::ScheduleResult result = 
         _buckets[butil::fmix64(pthread_numeric_id()) % _options.num_buckets]
         .schedule(fn, arg, abstime);
+	// 如果当前注册的任务是最早超时的，唤醒timer线程
     if (result.earlier) {
         bool earlier = false;
         const int64_t run_time = butil::timespec_to_microseconds(abstime);
@@ -272,6 +275,8 @@ bool TimerThread::Task::run_and_delete() {
     const uint32_t id_version = version_of_task_id(task_id);
     uint32_t expected_version = id_version;
     // This CAS is rarely contended, should be fast.
+
+	// 运行超时任务并更新版本
     if (version.compare_exchange_strong(
             expected_version, id_version + 1, butil::memory_order_relaxed)) {
         fn(arg);
@@ -293,6 +298,7 @@ bool TimerThread::Task::run_and_delete() {
 }
 
 bool TimerThread::Task::try_delete() {
+	// 使用版本控制来避免ABA问题
     const uint32_t id_version = version_of_task_id(task_id);
     if (version.load(butil::memory_order_relaxed) != id_version) {
         CHECK_EQ(version.load(butil::memory_order_relaxed), id_version + 2);
@@ -307,17 +313,21 @@ static T deref_value(void* arg) {
     return *(T*)arg;
 }
 
+// 单独的一个线程处理定时任务
 void TimerThread::run() {
     run_worker_startfn();
 #ifdef BAIDU_INTERNAL
     logging::ComlogInitializer comlog_initializer;
 #endif
 
+	// 初始化上一次被唤醒的时刻
     int64_t last_sleep_time = butil::gettimeofday_us();
     BT_VLOG << "Started TimerThread=" << pthread_self();
 
     // min heap of tasks (ordered by run_time)
-    std::vector<Task*> tasks;
+	// 保存所有任务，使用std::push_heap和std::pop_heap维护最小堆
+	// priority_queue可代替
+	std::vector<Task*> tasks;
     tasks.reserve(4096);
 
     // vars
@@ -335,24 +345,29 @@ void TimerThread::run() {
         ntriggered_second.expose_as(_options.bvar_prefix, "triggered_second");
         busy_seconds_second.expose_as(_options.bvar_prefix, "usage");
     }
-    
+
+	// 后台无限循环
     while (!_stop.load(butil::memory_order_relaxed)) {
         // Clear _nearest_run_time before consuming tasks from buckets.
         // This helps us to be aware of earliest task of the new tasks before we
         // would run the consumed tasks.
         {
             BAIDU_SCOPED_LOCK(_mutex);
-            _nearest_run_time = std::numeric_limits<int64_t>::max();
+			// _nearest_run_time表示当前时刻最早的超时时间，初始化为最大值
+			_nearest_run_time = std::numeric_limits<int64_t>::max();
         }
         
         // Pull tasks from buckets.
+        // 把所有任务丢到最小堆中进行排序
         for (size_t i = 0; i < _options.num_buckets; ++i) {
             Bucket& bucket = _buckets[i];
-            for (Task* p = bucket.consume_tasks(); p != nullptr; ++nscheduled) {
+			// consume_tasks()将bucket中所有的任务提取出来(返回链表头并重置)
+			for (Task* p = bucket.consume_tasks(); p != nullptr; ++nscheduled) {
                 // p->next should be kept first
                 // in case of the deletion of Task p which is unscheduled
                 Task* next_task = p->next;
 
+				// 如果当前任务已经被取消，直接删掉，否则追加到最小堆中
                 if (!p->try_delete()) { // remove the task if it's unscheduled
                     tasks.push_back(p);
                     std::push_heap(tasks.begin(), tasks.end(), task_greater);
@@ -361,14 +376,19 @@ void TimerThread::run() {
             }
         }
 
+		// 是否需要重新排序
         bool pull_again = false;
+
+		// 遍历所有任务，此时tasks为最小堆
         while (!tasks.empty()) {
+			// 超时时间最近的任务，判断是否超时
             Task* task1 = tasks[0];  // the about-to-run task
             if (task1->try_delete()) { // already unscheduled
                 std::pop_heap(tasks.begin(), tasks.end(), task_greater);
                 tasks.pop_back();
                 continue;
             }
+			// 没有超时，其它任务也不会超时，跳出循环
             if (butil::gettimeofday_us() < task1->run_time) {  // not ready yet.
                 break;
             }
@@ -383,6 +403,9 @@ void TimerThread::run() {
             // insertion, and they'll grab _mutex and change _nearest_run_time
             // frequently, fortunately this is not true at most of time).
             {
+            	// 判断在处理tasks中的超时任务期间，是否又新建了其它的超时任务且
+            	// 新建的任务超时时间更短，如果是，重新拉取task并排序
+            	// _nearest_run_time表示当前最早的超时任务的超时时间
                 BAIDU_SCOPED_LOCK(_mutex);
                 if (task1->run_time > _nearest_run_time) {
                     // a task is earlier than task1. We need to check buckets.
@@ -390,18 +413,23 @@ void TimerThread::run() {
                     break;
                 }
             }
+			// 运行当前这个超时任务并删除
             std::pop_heap(tasks.begin(), tasks.end(), task_greater);
             tasks.pop_back();
             if (task1->run_and_delete()) {
+				// 记录触发的超时任务个数
                 ++ntriggered;
             }
         }
+		// 重新拉取任务并排序，此时tasks并没有清空，也没必要
         if (pull_again) {
             BT_VLOG << "pull again, tasks=" << tasks.size();
             continue;
         }
 
         // The realtime to wait for.
+        // 所有已经超时的任务都已经处理完成，剩下的都是些仍未超时的任务
+        // 计算最小的超时时间，挂起当前线程
         int64_t next_run_time = std::numeric_limits<int64_t>::max();
         if (tasks.empty()) {
             next_run_time = std::numeric_limits<int64_t>::max();
@@ -432,6 +460,8 @@ void TimerThread::run() {
             ptimeout = &next_timeout;
         }
         busy_seconds += (now - last_sleep_time) / 1000000.0;
+		// 当前线程挂起ptimeout时间后重新处理超时任务
+		// 如果在挂起期间调用sechedule注册了一个更早的任务，则被唤醒
         futex_wait_private(&_nsignals, expected_nsignals, ptimeout);
         last_sleep_time = butil::gettimeofday_us();
     }

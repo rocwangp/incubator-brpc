@@ -104,6 +104,9 @@ const char* status_str(Server::Status s) {
 
 butil::static_atomic<int> g_running_server_count = BUTIL_STATIC_ATOMIC_INIT(0);
 
+DEFINE_bool(reuse_addr, true, "Bind to ports in TIME_WAIT state");
+BRPC_VALIDATE_GFLAG(reuse_addr, PassValidate);
+
 // Following services may have security issues and are disabled by default.
 DEFINE_bool(enable_dir_service, false, "Enable /dir");
 DEFINE_bool(enable_threads_service, false, "Enable /threads");
@@ -540,7 +543,10 @@ bool is_http_protocol(const char* name) {
     return strcmp(name, "http") == 0 || strcmp(name, "h2") == 0;
 }
 
+// 创建一个监听器，保存所有允许的协议
 Acceptor* Server::BuildAcceptor() {
+
+	// 解析所有允许的协议名
     std::set<std::string> whitelist;
     for (butil::StringSplitter sp(_options.enabled_protocols.c_str(), ' ');
          sp; ++sp) {
@@ -553,6 +559,7 @@ Acceptor* Server::BuildAcceptor() {
         LOG(ERROR) << "Fail to new Acceptor";
         return NULL;
     }
+	// 只保存允许的协议handler
     InputMessageHandler handler;
     std::vector<Protocol> protocols;
     ListProtocols(&protocols);
@@ -692,6 +699,7 @@ static bool CreateConcurrencyLimiter(const AdaptiveMaxConcurrency& amc,
 
 static AdaptiveMaxConcurrency g_default_max_concurrency_of_method = 0;
 
+// 监听端口，开始运行Server
 int Server::StartInternal(const butil::ip_t& ip,
                           const PortRange& port_range,
                           const ServerOptions *opt) {
@@ -702,6 +710,8 @@ int Server::StartInternal(const butil::ip_t& ip,
             "fix it before starting server";
         return -1;
     }
+
+	// 初始化全局协议数组
     if (InitializeOnce() != 0) {
         LOG(ERROR) << "Fail to initialize Server[" << version() << ']';
         return -1;
@@ -717,6 +727,8 @@ int Server::StartInternal(const butil::ip_t& ip,
         }
         return -1;
     }
+
+	// 保存Server选项
     if (opt) {
         _options = *opt;
     } else {
@@ -934,9 +946,14 @@ int Server::StartInternal(const butil::ip_t& ip,
         return -1;
     }
     _listen_addr.ip = ip;
-    for (int port = port_range.min_port; port <= port_range.max_port; ++port) {
+	// 找到一个可以使用的端口
+	for (int port = port_range.min_port; port <= port_range.max_port; ++port) {
         _listen_addr.port = port;
-        butil::fd_guard sockfd(tcp_listen(_listen_addr));
+		
+		// 创建监听套接字
+        butil::fd_guard sockfd(tcp_listen(_listen_addr, FLAGS_reuse_addr));
+
+		// 当前port监听失败，重试
         if (sockfd < 0) {
             if (port != port_range.max_port) { // not the last port, try next
                 continue;
@@ -950,6 +967,8 @@ int Server::StartInternal(const butil::ip_t& ip,
             }
             return -1;
         }
+
+		// 如果监听的端口为0，说明让内核自动选择一个空闲的端口，获取这个端口
         if (_listen_addr.port == 0) {
             // port=0 makes kernel dynamically select a port from
             // https://en.wikipedia.org/wiki/Ephemeral_port
@@ -959,6 +978,8 @@ int Server::StartInternal(const butil::ip_t& ip,
                 return -1;
             }
         }
+
+		// 创建监听器
         if (_am == NULL) {
             _am = BuildAcceptor();
             if (NULL == _am) {
@@ -974,6 +995,8 @@ int Server::StartInternal(const butil::ip_t& ip,
         g_running_server_count.fetch_add(1, butil::memory_order_relaxed);
 
         // Pass ownership of `sockfd' to `_am'
+
+		// 传入监听套接字，开始监听
         if (_am->StartAccept(sockfd, _options.idle_timeout_sec,
                              _default_ssl_ctx) != 0) {
             LOG(ERROR) << "Fail to start acceptor";
@@ -996,7 +1019,7 @@ int Server::StartInternal(const butil::ip_t& ip,
         }
         butil::EndPoint internal_point = _listen_addr;
         internal_point.port = _options.internal_port;
-        butil::fd_guard sockfd(tcp_listen(internal_point));
+        butil::fd_guard sockfd(tcp_listen(internal_point, FLAGS_reuse_addr));
         if (sockfd < 0) {
             LOG(ERROR) << "Fail to listen " << internal_point << " (internal)";
             return -1;
@@ -1051,11 +1074,12 @@ int Server::StartInternal(const butil::ip_t& ip,
     return 0;
 }
 
+// 开始运行Server，监听端口endpoint
 int Server::Start(const butil::EndPoint& endpoint, const ServerOptions* opt) {
     return StartInternal(
         endpoint.ip, PortRange(endpoint.port, endpoint.port), opt);
 }
-
+// 开始运行Server，监听端口endpoint
 int Server::Start(const char* ip_port_str, const ServerOptions* opt) {
     butil::EndPoint point;
     if (str2endpoint(ip_port_str, &point) != 0 &&
@@ -1065,7 +1089,7 @@ int Server::Start(const char* ip_port_str, const ServerOptions* opt) {
     }
     return Start(point, opt);
 }
-
+// 开始运行Server，监听端口endpoint
 int Server::Start(int port, const ServerOptions* opt) {
     if (port < 0 || port > 65535) {
         LOG(ERROR) << "Invalid port=" << port;
@@ -1195,6 +1219,7 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
     const bool is_idl_support = sd->file()->options().GetExtension(idl_support);
 
     Tabbed* tabbed = dynamic_cast<Tabbed*>(service);
+	// 保存Method实例
     for (int i = 0; i < sd->method_count(); ++i) {
         const google::protobuf::MethodDescriptor* md = sd->method(i);
         MethodProperty mp;
@@ -1227,6 +1252,7 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
         }
     }
 
+	// 保存Service实例
     const ServiceProperty ss = {
         is_builtin_service, svc_opt.ownership, service, NULL };
     _fullname_service_map[sd->full_name()] = ss;

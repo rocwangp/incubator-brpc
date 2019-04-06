@@ -298,6 +298,7 @@ static void BaiduStreamingLogHandler(google::protobuf::LogLevel level,
     CHECK(false) << filename << ':' << line << ' ' << message;
 }
 
+// 初始化协议数组
 static void GlobalInitializeOrDieImpl() {
     //////////////////////////////////////////////////////////////////
     // Be careful about usages of gflags inside this function which //

@@ -953,6 +953,7 @@ void Controller::HandleSendFailed() {
     OnVersionedRPCReturned(info, new_bthread, _error_code);
 }
 
+// 提交RPC请求，调用Socket::Write
 void Controller::IssueRPC(int64_t start_realtime_us) {
     _current_call.begin_time_us = start_realtime_us;
     // Clear last error, Don't clear _error_text because we append to it.
@@ -994,6 +995,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         }
         _current_call.peer_id = _single_server_id;
     } else {
+		// 从LB中选择一个目标服务器进行连接
         LoadBalancer::SelectIn sel_in =
             { start_realtime_us, true,
               has_request_code(), _request_code, _accessed };
@@ -1035,6 +1037,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         }
     }
     // Handle connection type
+    // 根据连接类型选择一个Socket
     if (_connection_type == CONNECTION_TYPE_SINGLE ||
         _stream_creator != NULL) { // let user decides the sending_socket
         // in the callback(according to connection_type) directly
@@ -1049,8 +1052,11 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     } else {
         int rc = 0;
         if (_connection_type == CONNECTION_TYPE_POOLED) {
+			// 从SocketPool中取出一个Socket
+			// SocketPool中保存着所有和tmp_socket->remote_side相同的socket
             rc = tmp_sock->GetPooledSocket(&_current_call.sending_sock);
         } else if (_connection_type == CONNECTION_TYPE_SHORT) {
+        	// 每次都创建一个新连接
             rc = tmp_sock->GetShortSocket(&_current_call.sending_sock);
         } else {
             tmp_sock.reset();
@@ -1102,6 +1108,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     // Make request
     butil::IOBuf packet;
     SocketMessage* user_packet = NULL;
+	// 包装请求数据，调用protocol实现的函数
     _pack_request(&packet, &user_packet, cid.value, _method, this,
                   _request_buf, using_auth);
     // TODO: PackRequest may accept SocketMessagePtr<>?
@@ -1136,6 +1143,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     wopt.ignore_eovercrowded = has_flag(FLAGS_IGNORE_EOVERCROWDED);
     int rc;
     size_t packet_size = 0;
+	// 发送请求
     if (user_packet_guard) {
         if (span) {
             packet_size = user_packet_guard->EstimatedByteSize();

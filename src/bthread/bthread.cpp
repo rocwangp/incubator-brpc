@@ -178,11 +178,17 @@ int bthread_start_urgent(bthread_t* __restrict tid,
     return bthread::start_from_non_worker(tid, attr, fn, arg);
 }
 
+// 创建协程，后台运行函数fn(arg)
 int bthread_start_background(bthread_t* __restrict tid,
                              const bthread_attr_t* __restrict attr,
                              void * (*fn)(void*),
                              void* __restrict arg) {
+    // tls: thread local storage
+    // tls_task_group: 当前线程的TaskGroup
     bthread::TaskGroup* g = bthread::tls_task_group;
+
+	// 如果当前线程存在TaskGroup，则将这个任务放到TaskGroup::_rq中
+	// 否则，放到remote_rq中
     if (g) {
         // start from worker
         return g->start_background<false>(tid, attr, fn, arg);
@@ -352,6 +358,9 @@ int bthread_timer_del(bthread_timer_t id) {
     return EINVAL;
 }
 
+// 协程sleep函数
+// 设置定时任务，一定时间后将当前协程重新添加到TaskGroup中
+// 进行任务切换，切换到其它任务执行
 int bthread_usleep(uint64_t microseconds) {
     bthread::TaskGroup* g = bthread::tls_task_group;
     if (NULL != g && !g->is_current_pthread_task()) {

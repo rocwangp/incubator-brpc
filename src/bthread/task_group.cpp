@@ -146,8 +146,14 @@ void TaskGroup::run_main_task() {
     
     TaskGroup* dummy = this;
     bthread_t tid;
+
+	// 选择一个ready的bthread去执行
+	// 先从当前TaskGroup中选择，没有的话从其它TaskGroup中选择
     while (wait_task(&tid)) {
+		// 切换上下文，调度bthread，开始执行协程函数
         TaskGroup::sched_to(&dummy, tid);
+		// 返回后切换回主线程
+		
         DCHECK_EQ(this, dummy);
         DCHECK_EQ(_cur_meta->stack, _main_stack);
         if (_cur_meta->tid != _main_tid) {
@@ -207,6 +213,7 @@ TaskGroup::~TaskGroup() {
     }
 }
 
+// 初始化TaskGroup
 int TaskGroup::init(size_t runqueue_capacity) {
     if (_rq.init(runqueue_capacity) != 0) {
         LOG(FATAL) << "Fail to init _rq";
@@ -216,6 +223,7 @@ int TaskGroup::init(size_t runqueue_capacity) {
         LOG(FATAL) << "Fail to init _remote_rq";
         return -1;
     }
+	// 创建主线程的协程栈
     ContextualStack* stk = get_stack(STACK_TYPE_MAIN, NULL);
     if (NULL == stk) {
         LOG(FATAL) << "Fail to get main stack container";
@@ -246,6 +254,9 @@ int TaskGroup::init(size_t runqueue_capacity) {
     return 0;
 }
 
+// 协程函数入口，make_context的时候会把这个函数的地址写到协程栈中
+// 首次jump_context切换到这个协程的时候会调到这个位置执行
+// 之后的jump_context切换会调到上一次jump走的位置，而不在是函数入口
 void TaskGroup::task_runner(intptr_t skip_remained) {
     // NOTE: tls_task_group is volatile since tasks are moved around
     //       different groups.
@@ -289,6 +300,7 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // not caught explicitly. This is consistent with other threading 
         // libraries.
         void* thread_return;
+		// 执行用户定义的函数
         try {
             thread_return = m->fn(m->arg);
         } catch (ExitException& e) {
@@ -408,6 +420,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     return 0;
 }
 
+// 将btid和fn(arg)放到当前TaskGroup中，等待任务调度
 template <bool REMOTE>
 int TaskGroup::start_background(bthread_t* __restrict th,
                                 const bthread_attr_t* __restrict attr,
@@ -543,6 +556,7 @@ void TaskGroup::ending_sched(TaskGroup** pg) {
     sched_to(pg, next_meta);
 }
 
+// 选择一个协程去调度
 void TaskGroup::sched(TaskGroup** pg) {
     TaskGroup* g = *pg;
     bthread_t next_tid = 0;
@@ -559,6 +573,7 @@ void TaskGroup::sched(TaskGroup** pg) {
     sched_to(pg, next_tid);
 }
 
+// 切换到任务TaskMeta
 void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
     TaskGroup* g = *pg;
 #ifndef NDEBUG
@@ -571,18 +586,27 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
     const int saved_errno = errno;
     void* saved_unique_user_ptr = tls_unique_user_ptr;
 
+	// 获取当前TaskGroup执行的任务元数据并进行保存切换
     TaskMeta* const cur_meta = g->_cur_meta;
+
+	// 当前时间
     const int64_t now = butil::cpuwide_time_ns();
+	// 当前任务占用的时间
     const int64_t elp_ns = now - g->_last_run_ns;
+	// 记录切换前的时间
     g->_last_run_ns = now;
+	// 增加任务执行时间
     cur_meta->stat.cputime_ns += elp_ns;
     if (cur_meta->tid != g->main_tid()) {
         g->_cumulated_cputime_ns += elp_ns;
     }
+	// 增加任务切换次数
     ++cur_meta->stat.nswitch;
+	// 增加全局切换次数
     ++ g->_nswitch;
     // Switch to the task
     if (__builtin_expect(next_meta != cur_meta, 1)) {
+		// 切换当前任务的元数据
         g->_cur_meta = next_meta;
         // Switch tls_bls
         cur_meta->local_storage = tls_bls;
@@ -598,6 +622,8 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
 
         if (cur_meta->stack != NULL) {
             if (next_meta->stack != cur_meta->stack) {
+				// 从cur任务上下文切换换next任务上下文
+				// 协程函数task_runner
                 jump_stack(cur_meta->stack, next_meta->stack);
                 // probably went to another group, need to assign g again.
                 g = tls_task_group;
@@ -726,12 +752,15 @@ struct SleepArgs {
     TaskGroup* group;
 };
 
+// 定时器超时回调，将协程重新添加到TaskGroup中
 static void ready_to_run_from_timer_thread(void* arg) {
     CHECK(tls_task_group == NULL);
     const SleepArgs* e = static_cast<const SleepArgs*>(arg);
     e->group->control()->choose_one_group()->ready_to_run_remote(e->tid);
 }
 
+// 当调用bthread_sleep时使用
+// 设置定时器，超时后将协程重新添加到TaskGroup中
 void TaskGroup::_add_sleep_event(void* void_args) {
     // Must copy SleepArgs. After calling TimerThread::schedule(), previous
     // thread may be stolen by a worker immediately and the on-stack SleepArgs
@@ -740,6 +769,8 @@ void TaskGroup::_add_sleep_event(void* void_args) {
     TaskGroup* g = e.group;
     
     TimerThread::TaskId sleep_id;
+
+	// 设置定时任务
     sleep_id = get_global_timer_thread()->schedule(
         ready_to_run_from_timer_thread, void_args,
         butil::microseconds_from_now(e.timeout_us));
@@ -775,16 +806,24 @@ void TaskGroup::_add_sleep_event(void* void_args) {
 }
 
 // To be consistent with sys_usleep, set errno and return -1 on error.
+// 将当前协程挂起，设置超时任务，timeout_us时间后将协程重新添加到TaskGroup中
 int TaskGroup::usleep(TaskGroup** pg, uint64_t timeout_us) {
+	// 如果挂起时间为0，直接唤醒
     if (0 == timeout_us) {
         yield(pg);
         return 0;
     }
+	// pg是协程运行的那个TaskGroup
     TaskGroup* g = *pg;
     // We have to schedule timer after we switched to next bthread otherwise
     // the timer may wake up(jump to) current still-running context.
+
+	// 获取当前协程信息
     SleepArgs e = { timeout_us, g->current_tid(), g->current_task(), g };
+	// 设置协程切换过程中执行的逻辑，将当前挂起的协程设置定时器
     g->set_remained(_add_sleep_event, &e);
+
+	// 当前TaskGroup调度下一个协程
     sched(pg);
     g = *pg;
     e.meta->current_sleep = 0;

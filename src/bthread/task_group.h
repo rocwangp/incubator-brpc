@@ -244,8 +244,13 @@ friend class TaskControl;
     size_t _steal_offset;
     ContextualStack* _main_stack;
     bthread_t _main_tid;
+
+	// bthread_start_background保存的任务存在rq中，等待wait_tid拿走执行
     WorkStealingQueue<bthread_t> _rq;
+
+	// 未选择TaskGroup的后台任务，分配给了当前的TaskGroup，在当前TaskGroup执行
     RemoteTaskQueue _remote_rq;
+	
     int _remote_num_nosignal;
     int _remote_nsignaled;
 };

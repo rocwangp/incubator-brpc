@@ -83,6 +83,9 @@ EventDispatcher::~EventDispatcher() {
     }
 }
 
+/* 
+ * 后台运行epoll_wait
+ */
 int EventDispatcher::Start(const bthread_attr_t* consumer_thread_attr) {
     if (_epfd < 0) {
 #if defined(OS_LINUX)
@@ -351,6 +354,11 @@ static void StopAndJoinGlobalDispatchers() {
         g_edisp[i].Join();
     }
 }
+
+/**
+ * 创建EPOLL线程池，每个EPOLL运行在单独创建的线程中，阻塞在epoll_wait上
+ */
+
 void InitializeGlobalDispatchers() {
     g_edisp = new EventDispatcher[FLAGS_event_dispatcher_num];
     for (int i = 0; i < FLAGS_event_dispatcher_num; ++i) {
@@ -363,6 +371,10 @@ void InitializeGlobalDispatchers() {
     CHECK_EQ(0, atexit(StopAndJoinGlobalDispatchers));
 }
 
+/**
+ * 创建EPOLL线程池
+ * pthread_once(...) 保证当前进程只执行一次
+ */
 EventDispatcher& GetGlobalEventDispatcher(int fd) {
     pthread_once(&g_edisp_once, InitializeGlobalDispatchers);
     if (FLAGS_event_dispatcher_num == 1) {

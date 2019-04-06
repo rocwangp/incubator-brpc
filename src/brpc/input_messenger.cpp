@@ -97,14 +97,18 @@ ParseResult InputMessenger::CutInputMessage(
         }
         m->set_preferred_index(-1);
     }
+
+	// 遍历所有的protocol，找到第一个能解析消息的protocol
     for (int i = 0; i <= max_index; ++i) {
         if (i == preferred || _handlers[i].parse == NULL) {
             // Don't try preferred handler(already tried) or invalid handler
             continue;
         }
+		// 尝试去解析
         ParseResult result = _handlers[i].parse(&m->_read_buf, m, read_eof, _handlers[i].arg);
         if (result.is_ok() ||
             result.error() == PARSE_ERROR_NOT_ENOUGH_DATA) {
+            // 解析成功，记录当前protocol的索引，返回解析结果
             m->set_preferred_index(i);
             *index = i;
             return result;
@@ -128,6 +132,7 @@ ParseResult InputMessenger::CutInputMessage(
     return MakeParseError(PARSE_ERROR_TRY_OTHERS);
 }
 
+// 收到消息后进行处理，调用指定protocol的Process函数
 void* ProcessInputMessage(void* void_arg) {
     InputMessageBase* msg = static_cast<InputMessageBase*>(void_arg);
     msg->_process(msg);
@@ -140,6 +145,8 @@ struct RunLastMessage {
     }
 };
 
+// 读到消息并成功解析后，将消息进行后台处理
+// 以http为例，在Cut
 static void QueueMessage(InputMessageBase* to_run_msg,
                          int* num_bthread_created,
                          bthread_keytable_pool_t* keytable_pool) {
@@ -163,6 +170,15 @@ static void QueueMessage(InputMessageBase* to_run_msg,
     }
 }
 
+// 收到连接上的可读事件时调用
+// 1. 从Socket上读取数据到IOBuf
+// 	1.1 如果读取长度为0，说明连接关闭，退出
+//  1.2 如果读取长度小于0，说明需要等待数据的到来，退出
+// 2. 遍历所有的protocols，找到第一个能够解析消息的protocol
+//  2.1 如果解析失败，说明没有符合要求的协议，退出
+//	2.2 如果解析不完整，说明数据不够，回到步骤1继续读取
+// 3. 对解析出的数据进行处理，调用QueueMessage，后台执行protocol::process
+// 4. 回到步骤1
 void InputMessenger::OnNewMessages(Socket* m) {
     // Notes:
     // - If the socket has only one message, the message will be parsed and
@@ -175,6 +191,7 @@ void InputMessenger::OnNewMessages(Socket* m) {
     // - Verify will always be called in this bthread at most once and before
     //   any process.
     InputMessenger* messenger = static_cast<InputMessenger*>(m->user());
+	// handlers保存了当前Service上的所有protocols
     const InputMessageHandler* handlers = messenger->_handlers;
     int progress = Socket::PROGRESS_INIT;
 
@@ -196,6 +213,7 @@ void InputMessenger::OnNewMessages(Socket* m) {
         }
 
         // Read.
+        // 批量从fd中读取once_read大小的数据，保存在read_buf中
         const ssize_t nr = m->DoRead(once_read);
         if (nr <= 0) {
             if (0 == nr) {
@@ -219,18 +237,23 @@ void InputMessenger::OnNewMessages(Socket* m) {
                 continue;
             }
         }
-        
+
+		// 记录读取的字节数
         m->AddInputBytes(nr);
 
         // Avoid this socket to be closed due to idle_timeout_s
         m->_last_readtime_us.store(received_us, butil::memory_order_relaxed);
-        
+
+		// 获取IOBuf中字节个数
         size_t last_size = m->_read_buf.length();
         int num_bthread_created = 0;
         while (1) {
             size_t index = 8888;
+			// 遍历每个protocol，找到一个可以解析消息的protocol，记录protocol的index
+			// 如果解析成功，会释放m->_read_buf对应的Block
             ParseResult pr = messenger->CutInputMessage(m, &index, read_eof);
             if (!pr.is_ok()) {
+				// 没有可以解析消息的协议
                 if (pr.error() == PARSE_ERROR_NOT_ENOUGH_DATA) {
                     // incomplete message, re-read.
                     // However, some buffer may have been consumed
@@ -252,9 +275,13 @@ void InputMessenger::OnNewMessages(Socket* m) {
                 }
             }
 
+			// 记录读取的Message个数
             m->AddInputMessages(1);
             // Calculate average size of messages
+            // 获取IOBuf中字节个数，和last_size比少了单次解析的消息大小
             const size_t cur_size = m->_read_buf.length();
+
+			// 如果IOBuf中的所有数据都已经处理完成，就把Block释放，返回给TLS，用于下次的数据存储
             if (cur_size == 0) {
                 // _read_buf is consumed, it's good timing to return blocks
                 // cached internally back to TLS, otherwise the memory is not
@@ -428,8 +455,11 @@ int InputMessenger::Create(const butil::EndPoint& remote_side,
     return Socket::Create(options, id);
 }
 
+// 创建Socket对象，返回socket id
 int InputMessenger::Create(SocketOptions options, SocketId* id) {
     options.user = this;
+
+	// 当socket上有事件发生时，epoll会回调OnNewMessages
     options.on_edge_triggered_events = OnNewMessages;
     return Socket::Create(options, id);
 }
