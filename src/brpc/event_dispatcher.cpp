@@ -222,6 +222,8 @@ int EventDispatcher::RemoveEpollOut(SocketId socket_id,
     return -1;
 }
 
+// 将socket id和fd添加到epoll中
+// 通过socket id可以找到Socket对象
 int EventDispatcher::AddConsumer(SocketId socket_id, int fd) {
     if (_epfd < 0) {
         errno = EINVAL;
@@ -229,11 +231,14 @@ int EventDispatcher::AddConsumer(SocketId socket_id, int fd) {
     }
 #if defined(OS_LINUX)
     epoll_event evt;
+	// 监听可读状态
     evt.events = EPOLLIN | EPOLLET;
+	// 保存socket id，当激活时，通过id找到Socket对象
     evt.data.u64 = socket_id;
 #ifdef BRPC_SOCKET_HAS_EOF
     evt.events |= has_epollrdhup;
 #endif
+	// 将fd添加到epoll中
     return epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &evt);
 #elif defined(OS_MACOSX)
     struct kevent evt;
@@ -310,6 +315,7 @@ void EventDispatcher::Run() {
 #endif
             break;
         }
+		// 处理所有可读事件
         for (int i = 0; i < n; ++i) {
 #if defined(OS_LINUX)
             if (e[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)
@@ -318,6 +324,7 @@ void EventDispatcher::Run() {
 #endif
                 ) {
                 // We don't care about the return value.
+                // e[i].data.u64是socket id，通过id可以找到Socket对象
                 Socket::StartInputEvent(e[i].data.u64, e[i].events,
                                         _consumer_thread_attr);
             }

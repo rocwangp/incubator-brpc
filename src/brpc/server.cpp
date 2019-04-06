@@ -737,6 +737,7 @@ int Server::StartInternal(const butil::ip_t& ip,
         _options = ServerOptions();
     }
 
+	// http2.0
     if (!_options.h2_settings.IsValid(true/*log_error*/)) {
         LOG(ERROR) << "Invalid h2_settings";
         return -1;
@@ -1178,6 +1179,7 @@ int Server::Join() {
     return 0;
 }
 
+// 增加用户定义的Service
 int Server::AddServiceInternal(google::protobuf::Service* service,
                                bool is_builtin_service,
                                const ServiceOptions& svc_opt) {
@@ -1185,13 +1187,17 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
         LOG(ERROR) << "Parameter[service] is NULL!";
         return -1;
     }
+	// 获取Service相关的信息
     const google::protobuf::ServiceDescriptor* sd = service->GetDescriptor();
+	
+	// 如果没有提供Method，则不添加
     if (sd->method_count() == 0) {
         LOG(ERROR) << "service=" << sd->full_name()
                    << " does not have any method.";
         return -1;
     }
-    
+
+	// 初始化全局数据，协议，扩展等
     if (InitializeOnce() != 0) {
         LOG(ERROR) << "Fail to initialize Server[" << version() << ']';
         return -1;
@@ -1201,7 +1207,9 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
                    << version() << "] which is " << status_str(status());
         return -1;
     }
-        
+
+
+	// 要添加的Service已经存在
     if (_fullname_service_map.seek(sd->full_name()) != NULL) {
         LOG(ERROR) << "service=" << sd->full_name() << " already exists";
         return -1;
@@ -1219,7 +1227,7 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
     const bool is_idl_support = sd->file()->options().GetExtension(idl_support);
 
     Tabbed* tabbed = dynamic_cast<Tabbed*>(service);
-	// 保存Method实例
+	// 保存每个Method实例
     for (int i = 0; i < sd->method_count(); ++i) {
         const google::protobuf::MethodDescriptor* md = sd->method(i);
         MethodProperty mp;
@@ -1412,6 +1420,7 @@ ServiceOptions::ServiceOptions()
 #endif
     {}
 
+// 增加用户定义的Service
 int Server::AddService(google::protobuf::Service* service,
                        ServiceOwnership ownership) {
     ServiceOptions options;

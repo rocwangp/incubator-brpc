@@ -190,6 +190,8 @@ void InputMessenger::OnNewMessages(Socket* m) {
     //   is batched(notice the BTHREAD_NOSIGNAL and bthread_flush).
     // - Verify will always be called in this bthread at most once and before
     //   any process.
+
+	// 所有Socket的user都是Acceptor，handlers是在BuildAcceptor中初始化的
     InputMessenger* messenger = static_cast<InputMessenger*>(m->user());
 	// handlers保存了当前Service上的所有protocols
     const InputMessageHandler* handlers = messenger->_handlers;
@@ -205,6 +207,8 @@ void InputMessenger::OnNewMessages(Socket* m) {
         const int64_t base_realtime = butil::gettimeofday_us() - received_us;
 
         // Calculate bytes to be read.
+
+		// 设置一次读取的字节数
         size_t once_read = m->_avg_msg_size * 16;
         if (once_read < MIN_ONCE_READ) {
             once_read = MIN_ONCE_READ;
@@ -215,7 +219,9 @@ void InputMessenger::OnNewMessages(Socket* m) {
         // Read.
         // 批量从fd中读取once_read大小的数据，保存在read_buf中
         const ssize_t nr = m->DoRead(once_read);
+
         if (nr <= 0) {
+			// 连接已经关闭
             if (0 == nr) {
                 // Set `read_eof' flag and proceed to feed EOF into `Protocol'
                 // (implied by m->_read_buf.empty), which may produce a new
@@ -223,6 +229,7 @@ void InputMessenger::OnNewMessages(Socket* m) {
                 LOG_IF(WARNING, FLAGS_log_connection_close) << *m << " was closed by remote side";
                 read_eof = true;                
             } else if (errno != EAGAIN) {
+			// 读取失败，重试
                 if (errno == EINTR) {
                     continue;  // just retry
                 }
@@ -232,8 +239,10 @@ void InputMessenger::OnNewMessages(Socket* m) {
                              m->description().c_str(), berror(saved_errno));
                 return;
             } else if (!m->MoreReadEvents(&progress)) {
+			// 读事件没有再次被激活，退出等待
                 return;
             } else { // new events during processing
+           	// 有新的可读事件，直接重新读
                 continue;
             }
         }
@@ -242,11 +251,15 @@ void InputMessenger::OnNewMessages(Socket* m) {
         m->AddInputBytes(nr);
 
         // Avoid this socket to be closed due to idle_timeout_s
+        // 记录调用DoRead的时间
         m->_last_readtime_us.store(received_us, butil::memory_order_relaxed);
 
-		// 获取IOBuf中字节个数
+		// 获取IOBuf中字节个数(DoRead读到的字节数+以前剩余的字节数)
         size_t last_size = m->_read_buf.length();
         int num_bthread_created = 0;
+
+		// 持续处理读到的消息，先解析，后处理
+		// 直到处理完成或者数据不完整，重新进行读操作
         while (1) {
             size_t index = 8888;
 			// 遍历每个protocol，找到一个可以解析消息的protocol，记录protocol的index
@@ -277,6 +290,7 @@ void InputMessenger::OnNewMessages(Socket* m) {
 
 			// 记录读取的Message个数
             m->AddInputMessages(1);
+			
             // Calculate average size of messages
             // 获取IOBuf中字节个数，和last_size比少了单次解析的消息大小
             const size_t cur_size = m->_read_buf.length();
@@ -289,7 +303,11 @@ void InputMessenger::OnNewMessages(Socket* m) {
                 // in situations that most connections are idle.
                 m->_read_buf.return_cached_blocks();
             }
+
+			// 记录处理的数据大小
             m->_last_msg_size += (last_size - cur_size);
+
+			// last_size表示上一次IOBuf中的字节数
             last_size = cur_size;
             const size_t old_avg = m->_avg_msg_size;
             if (old_avg != 0) {
@@ -303,20 +321,33 @@ void InputMessenger::OnNewMessages(Socket* m) {
             if (pr.message() == NULL) { // the Process() step can be skipped.
                 continue;
             }
+
+			// 记录消息收到的绝对时间和相对时间
             pr.message()->_received_us = received_us;
             pr.message()->_base_real_us = base_realtime;
                         
             // This unique_ptr prevents msg to be lost before transfering
             // ownership to last_msg
+
+			// 对于不同的协议处理的数据，pr.message()返回不同的类型
+			// 如http会返回H	ttpContext
             DestroyingPtr<InputMessageBase> msg(pr.message());
+
+			// 处理上次剩下的数据，如果last_msg非空的话
             QueueMessage(last_msg.release(), &num_bthread_created,
                              m->_keytable_pool);
+
+			// 选择的协议没有处理函数
             if (handlers[index].process == NULL) {
                 LOG(ERROR) << "process of index=" << index << " is NULL";
                 continue;
             }
+
+			// 重置msg中的socket对象为当前socket
             m->ReAddress(&msg->_socket);
             m->PostponeEOF();
+
+			// 保存对应协议的处理函数和参数
             msg->_process = handlers[index].process;
             msg->_arg = handlers[index].arg;
             
@@ -343,8 +374,12 @@ void InputMessenger::OnNewMessages(Socket* m) {
                 // Transfer ownership to last_msg
                 last_msg.reset(msg.release());
             } else {
+            	// 处理消息
                 QueueMessage(msg.release(), &num_bthread_created,
                                  m->_keytable_pool);
+
+				// 当所有的TaskGroup都没有协程可以执行时，会阻塞在wait_task上
+				// bthread_flush用于唤醒某些TaskGroup继续执行
                 bthread_flush();
                 num_bthread_created = 0;
             }
@@ -373,7 +408,11 @@ InputMessenger::~InputMessenger() {
     _capacity = 0;
 }
 
+// 增加协议处理函数，一个handler包含
+// 解析消息
+// 处理消息
 int InputMessenger::AddHandler(const InputMessageHandler& handler) {
+	// handler为空，直接返回
     if (handler.parse == NULL || handler.process == NULL 
             || handler.name == NULL) {
         CHECK(false) << "Invalid argument";
@@ -381,6 +420,7 @@ int InputMessenger::AddHandler(const InputMessageHandler& handler) {
     }
     BAIDU_SCOPED_LOCK(_add_handler_mutex);
     if (NULL == _handlers) {
+		// 创建handler数组，保存所有的handler
         _handlers = new (std::nothrow) InputMessageHandler[_capacity];
         if (NULL == _handlers) {
             LOG(FATAL) << "Fail to new array of InputMessageHandler";
@@ -393,11 +433,13 @@ int InputMessenger::AddHandler(const InputMessageHandler& handler) {
         CHECK(false) << "AddNonProtocolHandler was invoked";
         return -1;
     }
+	// 根据handler查找协议类型
     ProtocolType type = FindProtocolOfHandler(handler);
     if (type == PROTOCOL_UNKNOWN) {
         CHECK(false) << "Adding a handler which doesn't belong to any protocol";
         return -1;
     }
+	// type作为在handlers中的索引
     const int index = type;
     if (index >= (int)_capacity) {
         LOG(FATAL) << "Can't add more handlers than " << _capacity;
@@ -490,6 +532,7 @@ const char* InputMessenger::NameOfProtocol(int n) const {
     return _handlers[n].name;
 }
 
+// 根据Handler查找协议
 static ProtocolType FindProtocolOfHandler(const InputMessageHandler& h) {
     std::vector<std::pair<ProtocolType, Protocol> > vec;
     ListProtocols(&vec);

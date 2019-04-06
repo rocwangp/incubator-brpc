@@ -307,6 +307,7 @@ static void GlobalInitializeOrDieImpl() {
     //////////////////////////////////////////////////////////////////
 
     // Ignore SIGPIPE.
+    // 忽略SIGPIPE信息，否则当对端关闭后连续两次write会触发SIGPIPE信号，终止程序
     struct sigaction oldact;
     if (sigaction(SIGPIPE, NULL, &oldact) != 0 ||
             (oldact.sa_handler == NULL && oldact.sa_sigaction == NULL)) {
@@ -320,6 +321,7 @@ static void GlobalInitializeOrDieImpl() {
     // the variable before main() for only once.
     // setenv("TCMALLOC_SAMPLE_PARAMETER", "524288", 0);
 
+	// openssl相关加载流程
     // Initialize openssl library
     SSL_library_init();
     // RPC doesn't require openssl.cnf, users can load it by themselves if needed

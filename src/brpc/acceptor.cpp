@@ -80,14 +80,16 @@ int Acceptor::StartAccept(int listened_fd, int idle_timeout_sec,
 	// 只有设置了fd，Socket::Create才会将其添加到EPOLL中，默认的Socket::Create不会
     options.fd = listened_fd;
     options.user = this;
+	// epoll激活fd后调用
     options.on_edge_triggered_events = OnNewConnections;
-	// 创建一个Socket对象，和监听套接字fd绑定
+	// 创建一个Socket对象，和监听套接字fd绑定，并将其添加到EPOLL中
     if (Socket::Create(options, &_acception_id) != 0) {
         // Close-idle-socket thread will be stopped inside destructor
         LOG(FATAL) << "Fail to create _acception_id";
         return -1;
     }
-    
+
+	// 保存监听套接字
     _listened_fd = listened_fd;
     _status = RUNNING;
     return 0;
@@ -240,14 +242,17 @@ void Acceptor::ListConnections(std::vector<SocketId>* conn_list) {
     return ListConnections(conn_list, std::numeric_limits<size_t>::max());
 }
 
-// 接收连接
+// 接收连接，直到所有连接都接收完成后返回
 void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
     while (1) {
         struct sockaddr in_addr;
         socklen_t in_len = sizeof(in_addr);
+
+		// 接收客户端连接，获取套接字fd
         butil::fd_guard in_fd(accept(acception->fd(), &in_addr, &in_len));
         if (in_fd < 0) {
             // no EINTR because listened fd is non-blocking.
+            // 所有的连接请求已经处理完成，退出
             if (errno == EAGAIN) {
                 return;
             }
@@ -261,6 +266,7 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
             continue;
         }
 
+		// 获取这个socket所属的对象，监听套接字为Acceptor
         Acceptor* am = dynamic_cast<Acceptor*>(acception->user());
         if (NULL == am) {
             LOG(FATAL) << "Impossible! acception->user() MUST be Acceptor";
@@ -272,11 +278,16 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
         SocketId socket_id;
         SocketOptions options;
         options.keytable_pool = am->_keytable_pool;
-        options.fd = in_fd;
+		// 客户端套接字
+		options.fd = in_fd;
+		// 客户端地址
         options.remote_side = butil::EndPoint(*(sockaddr_in*)&in_addr);
+		// 这个socket所属的对象，和监听套接字相同，为Acceptor
         options.user = acception->user();
+		// 可读时的回调函数
         options.on_edge_triggered_events = InputMessenger::OnNewMessages;
         options.initial_ssl_ctx = am->_ssl_ctx;
+		// 创建Socket对象，和in_fd绑定，并将其添加到EPOLL中
         if (Socket::Create(options, &socket_id) != 0) {
             LOG(ERROR) << "Fail to create Socket";
             continue;

@@ -25,6 +25,7 @@
 namespace bthread {
 
 // Park idle workers.
+// 信号量
 class BAIDU_CACHELINE_ALIGNMENT ParkingLot {
 public:
     class State {

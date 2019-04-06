@@ -667,6 +667,9 @@ void TaskGroup::destroy_self() {
     }
 }
 
+// 将bthread id添加到TaskGroup的rq中
+// 可选择的调用futex去唤醒阻塞在wait_task上的TaskGroup
+// num_nosignal记录没有被唤醒的任务书
 void TaskGroup::ready_to_run(bthread_t tid, bool nosignal) {
     push_rq(tid);
     if (nosignal) {
@@ -675,6 +678,7 @@ void TaskGroup::ready_to_run(bthread_t tid, bool nosignal) {
         const int additional_signal = _num_nosignal;
         _num_nosignal = 0;
         _nsignaled += 1 + additional_signal;
+		// 唤醒一定数量的task
         _control->signal_task(1 + additional_signal);
     }
 }

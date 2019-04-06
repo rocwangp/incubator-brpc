@@ -196,6 +196,7 @@ int bthread_start_background(bthread_t* __restrict tid,
     return bthread::start_from_non_worker(tid, attr, fn, arg);
 }
 
+// 唤醒bthread
 void bthread_flush() {
     bthread::TaskGroup* g = bthread::tls_task_group;
     if (g) {

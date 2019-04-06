@@ -226,6 +226,8 @@ friend class TaskControl;
     
     // the control that this group belongs to
     TaskControl* _control;
+
+	// 保存需要唤醒的任务
     int _num_nosignal;
     int _nsignaled;
     // last scheduling time

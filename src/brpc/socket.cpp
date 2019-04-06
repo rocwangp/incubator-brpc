@@ -544,6 +544,8 @@ int Socket::ResetFileDescriptor(int fd) {
     _avg_msg_size = 0;
     // MUST store `_fd' before adding itself into epoll device to avoid
     // race conditions with the callback function inside epoll
+
+	// 绑定fd和当前的Socket
     _fd.store(fd, butil::memory_order_release);
     _reset_fd_real_us = butil::gettimeofday_us();
 
@@ -616,8 +618,9 @@ int Socket::ResetFileDescriptor(int fd) {
 
 // 根据options创建Socket对象，返回对象id
 int Socket::Create(const SocketOptions& options, SocketId* id) {
+	// ResourceId用于在对象池中定位对象
     butil::ResourceId<Socket> slot;
-	// 从对象池中创建一个socket
+	// 从对象池中创建一个socket，返回对象id
     Socket* const m = butil::get_resource(&slot, Forbidden());
     if (m == NULL) {
         LOG(FATAL) << "Fail to get_resource<Socket>";
@@ -684,7 +687,8 @@ int Socket::Create(const SocketOptions& options, SocketId* id) {
     CHECK(NULL == m->_write_head.load(butil::memory_order_relaxed));
     // Must be last one! Internal fields of this Socket may be access
     // just after calling ResetFileDescriptor.
-    // 将套接字fd添加到EPOLL中
+    
+    // 将fd和当前Socket绑定，同时将套接字fd添加到EPOLL中
     if (m->ResetFileDescriptor(options.fd) != 0) {
         const int saved_errno = errno;
         PLOG(ERROR) << "Fail to ResetFileDescriptor";
@@ -1120,9 +1124,11 @@ void Socket::OnRecycle() {
     s_vars->nsocket << -1;
 }
 
+// 当Socket可读时，后台处理可读事件，参数为对应的Socket对象
 void* Socket::ProcessEvent(void* arg) {
     // the enclosed Socket is valid and free to access inside this function.
     SocketUniquePtr s(static_cast<Socket*>(arg));
+	// 调用对应的处理函数，如OnNewMessages和OnNewConnections
     s->_on_edge_triggered_events(s.get());
     return NULL;
 }
@@ -1580,7 +1586,7 @@ int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
         return SetError(opt.id_wait, EOVERCROWDED);
     }
 
-	// 将io buf包装为WriteRequest
+	// 从对象池中取出一个WriteRequest对象
     WriteRequest* req = butil::get_object<WriteRequest>();
     if (!req) {
         return SetError(opt.id_wait, ENOMEM);
@@ -2057,12 +2063,15 @@ AuthContext* Socket::mutable_auth_context() {
     return _auth_context
 }
 
+// 当socket可读时由epoll调用
 int Socket::StartInputEvent(SocketId id, uint32_t events,
                             const bthread_attr_t& thread_attr) {
     SocketUniquePtr s;
+	// 根据id找到对应的Socket对象
     if (Address(id, &s) < 0) {
         return -1;
     }
+	// 如果Socket对象没有设置回调函数，直接返回
     if (NULL == s->_on_edge_triggered_events) {
         // Callback can be NULL when receiving error epoll events
         // (Added into epoll by `WaitConnected')
@@ -2083,6 +2092,8 @@ int Socket::StartInputEvent(SocketId id, uint32_t events,
     // Passing e[i].events causes complex visibility issues and
     // requires stronger memory fences, since reading the fd returns
     // error as well, we don't pass the events.
+
+	// 记录Socket被激活的事件数量
     if (s->_nevent.fetch_add(1, butil::memory_order_acq_rel) == 0) {
         // According to the stats, above fetch_add is very effective. In a
         // server processing 1 million requests per second, this counter
@@ -2095,6 +2106,7 @@ int Socket::StartInputEvent(SocketId id, uint32_t events,
 
         bthread_attr_t attr = thread_attr;
         attr.keytable_pool = p->_keytable_pool;
+		// 后台处理Socket数据
         if (bthread_start_urgent(&tid, &attr, ProcessEvent, p) != 0) {
             LOG(FATAL) << "Fail to start ProcessEvent";
             ProcessEvent(p);

@@ -368,6 +368,8 @@ bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
     return stolen;
 }
 
+// 很多TaskGroup都阻塞在wait_task上，当注册协程时，可选择的唤醒TaskGroup
+// num_task表示未唤醒的任务数
 void TaskControl::signal_task(int num_task) {
     if (num_task <= 0) {
         return;
@@ -376,9 +378,12 @@ void TaskControl::signal_task(int num_task) {
     // be created to match caller's requests. But in another side, there's also
     // many useless signalings according to current impl. Capping the concurrency
     // is a good balance between performance and timeliness of scheduling.
+
+	// 最多一次唤醒两个
     if (num_task > 2) {
         num_task = 2;
     }
+	// TaskGroup都阻塞在不同的ParkingLot(信号量)上(pl.wait())，选择一个去唤醒
     int start_index = butil::fmix64(pthread_numeric_id()) % PARKING_LOT_NUM;
     num_task -= _pl[start_index].signal(1);
     if (num_task > 0) {
@@ -389,6 +394,7 @@ void TaskControl::signal_task(int num_task) {
             num_task -= _pl[start_index].signal(1);
         }
     }
+	// 建立新的worker线程去处理任务
     if (num_task > 0 &&
         FLAGS_bthread_min_concurrency > 0 &&    // test min_concurrency for performance
         _concurrency.load(butil::memory_order_relaxed) < FLAGS_bthread_concurrency) {

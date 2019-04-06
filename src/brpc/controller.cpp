@@ -986,6 +986,8 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     if (SingleServer()) {
         // Don't use _current_call.peer_id which is set to -1 after construction
         // of the backup call.
+
+		// 根据对象id在对象池中查找对象
         const int rc = Socket::Address(_single_server_id, &tmp_sock);
         if (rc != 0 || tmp_sock->IsLogOff()) {
             SetFailed(EHOSTDOWN, "Not connected to %s yet, server_id=%" PRIu64,

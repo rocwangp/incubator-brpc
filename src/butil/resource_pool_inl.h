@@ -119,7 +119,11 @@ public:
     // A Resource addresses at most RP_MAX_BLOCK_NGROUP BlockGroups,
     // each BlockGroup addresses at most RP_GROUP_NBLOCK blocks. So a
     // resource addresses at most RP_MAX_BLOCK_NGROUP * RP_GROUP_NBLOCK Blocks.
-    struct BlockGroup {
+
+	// 一个对象池中有多个BlockGroup
+	// 一个BlockGroup有多个Block
+	// 一个Block有多个T类型的对象组成的数组，地址空间连续
+	struct BlockGroup {
         butil::atomic<size_t> nblock;
         butil::atomic<Block*> blocks[RP_GROUP_NBLOCK];
 
@@ -160,7 +164,8 @@ public:
         // and "new T" are different: former one sets all fields to 0 which
         // we don't want.
 #define BAIDU_RESOURCE_POOL_GET(CTOR_ARGS)                              \
-        /* Fetch local free id */                                       \
+        /* Fetch local free id */      \
+        /* 线程局部对象池有空闲位置，分配一个给id并返回				*/ \
         if (_cur_free.nfree) {                                          \
             const ResourceId<T> free_id = _cur_free.ids[--_cur_free.nfree]; \
             *id = free_id;                                              \
@@ -170,6 +175,7 @@ public:
         /* Fetch a FreeChunk from global.                               \
            TODO: Popping from _free needs to copy a FreeChunk which is  \
            costly, but hardly impacts amortized performance. */         \
+        /* 从全局对象池中取出一个空闲链表作为局部对象池 */ \
         if (_pool->pop_free_chunk(_cur_free)) {                         \
             --_cur_free.nfree;                                          \
             const ResourceId<T> free_id =  _cur_free.ids[_cur_free.nfree]; \
@@ -189,20 +195,26 @@ public:
             return p;                                                   \
         }                                                               \
         /* Fetch a Block from global */                                 \
+        /* 向全局BlockGroup数组中添加一个Block */ \
+        /* cur_block_index表示当前Block是第几个Block */ \
         _cur_block = add_block(&_cur_block_index);                      \
         if (_cur_block != NULL) {                                       \
+			/* 一个Block下有BLOCK_NITEM个对象，计算当前对象是整个对象池中第几个对象 */ \
             id->value = _cur_block_index * BLOCK_NITEM + _cur_block->nitem; \
+            /* 在创建的Block中原地构造数组 */ \
             T* p = new ((T*)_cur_block->items + _cur_block->nitem) T CTOR_ARGS; \
             if (!ResourcePoolValidator<T>::validate(p)) {               \
                 p->~T();                                                \
                 return NULL;                                            \
             }                                                           \
+            /* Block元素个数加一 */ \
             ++_cur_block->nitem;                                        \
             return p;                                                   \
         }                                                               \
         return NULL;                                                    \
  
 
+		// 从对象池中返回一个对象，写入id
         inline T* get(ResourceId<T>* id) {
             BAIDU_RESOURCE_POOL_GET();
         }
@@ -219,8 +231,12 @@ public:
 
 #undef BAIDU_RESOURCE_POOL_GET
 
+		// 将资源对象id返回到对象池中
         inline int return_resource(ResourceId<T> id) {
             // Return to local free list
+
+			// 每个对象池都有局部空闲链表和全局空闲链表
+			// 先返回到局部空闲链表中
             if (_cur_free.nfree < ResourcePool::free_chunk_nitem()) {
                 _cur_free.ids[_cur_free.nfree++] = id;
                 BAIDU_RESOURCE_POOL_FREE_ITEM_NUM_ADD1;
@@ -228,6 +244,8 @@ public:
             }
             // Local free list is full, return it to global.
             // For copying issue, check comment in upper get()
+            // 如果局部链表已经满了，将这个链表放到全局链表中
+            // 重新初始化局部链表
             if (_pool->push_free_chunk(_cur_free)) {
                 _cur_free.nfree = 1;
                 _cur_free.ids[0] = id;
@@ -254,15 +272,23 @@ public:
     }
 
     static inline T* address_resource(ResourceId<T> id) {
-        const size_t block_index = id.value / BLOCK_NITEM;
+    	// 根据id计算对象所属的Block
+    	// id->value表示当前对象是整个对象池中第几个对象(偏移量)
+    	// id->value / BLOCK_NITEM: 当前对象所在的Block是整个对象池中第几个Block
+    	// id->value / BLOCK_NITEM / RP_GROUP_NBLOCK: 当前对象所在的Block所在的BlockGroup是整个对象池第几个BlockGroup
+		// RP_GROUP_NBLOCK = (1 << RP_GROUP_NBLOCK_NBIT)
+		const size_t block_index = id.value / BLOCK_NITEM;
         const size_t group_index = (block_index >> RP_GROUP_NBLOCK_NBIT);
         if (__builtin_expect(group_index < RP_MAX_BLOCK_NGROUP, 1)) {
+			// 获取当前对象所属的BlockGroup
             BlockGroup* bg =
                 _block_groups[group_index].load(butil::memory_order_consume);
             if (__builtin_expect(bg != NULL, 1)) {
+				// 获取当前对象所属的Block
                 Block* b = bg->blocks[block_index & (RP_GROUP_NBLOCK - 1)]
                            .load(butil::memory_order_consume);
                 if (__builtin_expect(b != NULL, 1)) {
+					// 获取当前对象
                     const size_t offset = id.value - block_index * BLOCK_NITEM;
                     if (__builtin_expect(offset < b->nitem, 1)) {
                         return (T*)b->items + offset;
@@ -274,6 +300,7 @@ public:
         return NULL;
     }
 
+	// 从线程局部对象池中分配一个对象，写入id
     inline T* get_resource(ResourceId<T>* id) {
         LocalPool* lp = get_or_new_local_pool();
         if (__builtin_expect(lp != NULL, 1)) {
@@ -300,6 +327,7 @@ public:
         return NULL;
     }
 
+	// 将对象id返回到线程局部对象池中
     inline int return_resource(ResourceId<T> id) {
         LocalPool* lp = get_or_new_local_pool();
         if (__builtin_expect(lp != NULL, 1)) {
@@ -381,22 +409,38 @@ private:
 
     // Create a Block and append it to right-most BlockGroup.
     static Block* add_block(size_t* index) {
+    	// 一个Block表示一堆类型T的对象集合，内存连续
         Block* const new_block = new(std::nothrow) Block;
         if (NULL == new_block) {
             return NULL;
         }
 
+		// 一个对象池有多个BlockGroup，一个BlockGroup有多个Block
+		// 选择一个BlockGroup存放新建的这个Block
         size_t ngroup;
         do {
+			// 获取当前对象池中BlockGroup个数，第一次执行时为0，需要创建
             ngroup = _ngroup.load(butil::memory_order_acquire);
+			// 对象池中有BlockGroup，尝试保存Block
             if (ngroup >= 1) {
+				// 获取最后一个BlockGroup，第一次执行时_ngroup为1，取出第0个BlockGroup
                 BlockGroup* const g =
                     _block_groups[ngroup - 1].load(butil::memory_order_consume);
+				// BlockGroup里面是Block数组，初始时nblock为0，所以将new_block放到第0个位置上
+				// g->nblock表示当前BlockGroup中已经有多少个Block了，初始时为0个
                 const size_t block_index =
                     g->nblock.fetch_add(1, butil::memory_order_relaxed);
+				// 判断BlockGroup中的Block数组是否已经满了
+				// 如果满了，就需要重新申请BlockGroup，否则可以进行保存
                 if (block_index < RP_GROUP_NBLOCK) {
+					// 保存Block
                     g->blocks[block_index].store(
                         new_block, butil::memory_order_release);
+					// 记录new_block的索引，计算方式为: 
+
+					// RP_GROUP_NBLOCK: 每个BlockGroup中最多可以存储的Block个数
+					// (ngroup - 1) * RP_GROUP_NBLOCK: 当前BlockGroup前面最多有多少个Block
+					// (ngroup - 1) * RP_GROUP_NBLOCK + block_index: 当前Block前面最多有多少个Block
                     *index = (ngroup - 1) * RP_GROUP_NBLOCK + block_index;
                     return new_block;
                 }
@@ -411,6 +455,9 @@ private:
 
     // Create a BlockGroup and append it to _block_groups.
     // Shall be called infrequently because a BlockGroup is pretty big.
+
+	// 创建一个BlockGroup，初始时_block_groups的每个元素为空，ngroup为空
+	// 需要创建
     static bool add_block_group(size_t old_ngroup) {
         BlockGroup* bg = NULL;
         BAIDU_SCOPED_LOCK(_block_group_mutex);
@@ -432,6 +479,7 @@ private:
         return bg != NULL;
     }
 
+	// 返回当前线程的局部对象池
     inline LocalPool* get_or_new_local_pool() {
         LocalPool* lp = _local_pool;
         if (lp != NULL) {
@@ -502,6 +550,7 @@ private:
     }
 
 private:
+	// 从全局对象池中取出一个空闲链表分配给局部对象池c
     bool pop_free_chunk(FreeChunk& c) {
         // Critical for the case that most return_object are called in
         // different threads of get_object.
@@ -513,6 +562,8 @@ private:
             pthread_mutex_unlock(&_free_chunks_mutex);
             return false;
         }
+		// free_chunks为全局对象池的空闲链表集合
+		// 从中弹出一个分配给局部空闲链表c.ids
         DynamicFreeChunk* p = _free_chunks.back();
         _free_chunks.pop_back();
         pthread_mutex_unlock(&_free_chunks_mutex);
