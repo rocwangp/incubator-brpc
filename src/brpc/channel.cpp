@@ -492,6 +492,7 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     }
 
 	// protocol实现的函数，将请求序列化到IO::buf
+	// http请求会生成请求头存放在cntl中
     _serialize_request(&cntl->_request_buf, cntl, request);
     if (cntl->FailedInline()) {
         return cntl->HandleSendFailed();

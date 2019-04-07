@@ -449,12 +449,19 @@ void ProcessHttpResponse(InputMessageBase* msg) {
     accessor.OnResponse(cid, saved_error);
 }
 
+// 将请求pbreq序列化到IOBuf中，同时将必要的信息保存到Controller中
+// 发送请求时调用协议相关的第一个函数
 void SerializeHttpRequest(butil::IOBuf* /*not used*/,
                           Controller* cntl,
                           const google::protobuf::Message* pbreq) {
+    // 取出Controller中的http请求头的引用，进行必要的信息赋值
     HttpHeader& hreq = cntl->http_request();
+
+	// 判断是否是http2.0
     const bool is_http2 = (cntl->request_protocol() == PROTOCOL_H2);
     bool is_grpc = false;
+
+	// 包装
     ControllerPrivateAccessor accessor(cntl);
     if (!accessor.protocol_param().empty() && hreq.content_type().empty()) {
         const std::string& param = accessor.protocol_param();
@@ -467,6 +474,7 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
             hreq.set_content_type(param);
         }
     }
+
     if (pbreq != NULL) {
         // If request is not NULL, message body will be serialized proto/json,
         if (!pbreq->IsInitialized()) {
@@ -478,6 +486,7 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
             return cntl->SetFailed(EREQUEST, "request_attachment must be empty "
                                    "when request is not NULL");
         }
+		// 设置http Connection-Type
         HttpContentType content_type = HTTP_CONTENT_OTHERS;
         if (hreq.content_type().empty()) {
             // Set content-type if user did not.
@@ -533,6 +542,7 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
         return cntl->SetFailed(EREQUEST, "%s",
                         hreq.uri().status().error_cstr());
     }
+	// 设置请求数据的压缩类型
     bool grpc_compressed = false;
     if (cntl->request_compress_type() != COMPRESS_TYPE_NONE) {
         if (cntl->request_compress_type() != COMPRESS_TYPE_GZIP) {
@@ -558,6 +568,8 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
     }
 
     // Fill log-id if user set it.
+
+	// 添加LOG-ID
     if (cntl->has_log_id()) {
         hreq.SetHeader(common->LOG_ID,
                           butil::string_printf(
@@ -566,6 +578,7 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
 
     if (!is_http2) {
         // HTTP before 1.1 needs to set keep-alive explicitly.
+        // 设置keep-alive
         if (hreq.before_http_1_1() &&
             cntl->connection_type() != CONNECTION_TYPE_SHORT &&
             hreq.GetHeader(common->CONNECTION) == NULL) {
@@ -591,9 +604,13 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
 
     // Set url to /ServiceName/MethodName when we're about to call protobuf
     // services (indicated by non-NULL method).
+
+	// 根据请求Service和Method设置http uri
     const google::protobuf::MethodDescriptor* method = cntl->method();
     if (method != NULL) {
+		// 默认POST Method
         hreq.set_method(HTTP_METHOD_POST);
+		// /ServiceName/MethodName
         std::string path;
         path.reserve(2 + method->service()->full_name().size()
                      + method->name().size());
@@ -601,6 +618,8 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
         path.append(method->service()->full_name());
         path.push_back('/');
         path.append(method->name());
+
+		// 设置uri
         hreq.uri().set_path(path);
     }
 
@@ -615,6 +634,9 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
     }
 }
 
+// 将请求数据包装成http request
+// 在发送请求之前调用，将controller中的数据转换成http请求，保存在IOBuf中
+// 是协议相关调用的第二个函数
 void PackHttpRequest(butil::IOBuf* buf,
                      SocketMessage**,
                      uint64_t correlation_id,
@@ -626,6 +648,7 @@ void PackHttpRequest(butil::IOBuf* buf,
         return cntl->SetFailed(EREQUEST, "http can't work with CONNECTION_TYPE_SINGLE");
     }
     ControllerPrivateAccessor accessor(cntl);
+
     HttpHeader* header = &cntl->http_request();
     if (auth != NULL && header->GetHeader(common->AUTHORIZATION) == NULL) {
         std::string auth_data;
@@ -639,6 +662,7 @@ void PackHttpRequest(butil::IOBuf* buf,
     // may not echo back this field. But we send it anyway.
     accessor.get_sending_socket()->set_correlation_id(correlation_id);
 
+	// 组装http请求
     MakeRawHttpRequest(buf, header, cntl->remote_side(),
                        &cntl->request_attachment());
     if (FLAGS_http_verbose) {
@@ -692,7 +716,9 @@ private:
     HttpResponseSender _sender;
 };
 
+// 将响应发送给客户端
 HttpResponseSender::~HttpResponseSender() {
+	// 获取当前请求的流程对象
     Controller* cntl = _cntl.get();
     if (cntl == NULL) {
         return;
@@ -713,9 +739,13 @@ HttpResponseSender::~HttpResponseSender() {
 
     const HttpHeader* req_header = &cntl->http_request();
     HttpHeader* res_header = &cntl->http_response();
+	// 构造http响应头
+
+	// 响应版本
     res_header->set_version(req_header->major_version(),
                             req_header->minor_version());
 
+	// 响应类型
     const std::string* content_type_str = &res_header->content_type();
     if (content_type_str->empty()) {
         // Use request's content_type if response's is not set.
@@ -775,6 +805,7 @@ HttpResponseSender::~HttpResponseSender() {
     // response header exists, the client must close its end of the connection
     // after receiving the response.
     if (!is_http2) {
+		// 判断是否长连接
         const std::string* res_conn = res_header->GetHeader(common->CONNECTION);
         if (res_conn == NULL || strcasecmp(res_conn->c_str(), "close") != 0) {
             const std::string* req_conn =
@@ -884,6 +915,7 @@ HttpResponseSender::~HttpResponseSender() {
             content = &cntl->response_attachment();
         }
         butil::IOBuf res_buf;
+		// 构造http响应数据
         MakeRawHttpResponse(&res_buf, res_header, content);
         if (FLAGS_http_verbose) {
             PrintMessage(res_buf, false, !!content);
@@ -891,6 +923,7 @@ HttpResponseSender::~HttpResponseSender() {
         if (span) {
             span->set_response_size(res_buf.size());
         }
+		// 发送响应给客户端
         rc = socket->Write(&res_buf, &wopt);
     }
 
@@ -1028,6 +1061,10 @@ FindMethodPropertyByURI(const std::string& uri_path, const Server* server,
     return NULL;
 }
 
+// 从Socket中读到数据的时候，会调用每个协议的parse函数尝试解析
+// source: 从Socket中读到的数据
+// socket: fd所属的Socket对象
+// read_eof: 是否已经读到eof
 ParseResult ParseHttpMessage(butil::IOBuf *source, Socket *socket,
                              bool read_eof, const void* /*arg*/) {
     HttpContext* http_imsg = 
@@ -1199,34 +1236,55 @@ void EndRunningCallMethodInPool(
     ::google::protobuf::Message* response,
     ::google::protobuf::Closure* done);
 
+// 处理http请求，msg在Parse函数中构造
 void ProcessHttpRequest(InputMessageBase *msg) {
+	// 记录请求处理的开始时间
     const int64_t start_parse_us = butil::cpuwide_time_us();
+	// 转换为在parse函数中构造的HttpContext
     DestroyingPtr<HttpContext> imsg_guard(static_cast<HttpContext*>(msg));
+	// 包装Socket对象
     SocketUniquePtr socket_guard(imsg_guard->ReleaseSocket());
     Socket* socket = socket_guard.get();
+
+	// msg->arg()在找到成功解析消息的handler后，使用handler->arg赋值
+	// handler->arg为Server
     const Server* server = static_cast<const Server*>(msg->arg());
     ScopedNonServiceError non_service_error(server);
 
+	// controller代表哦一个请求流程
     Controller* cntl = new (std::nothrow) Controller;
     if (NULL == cntl) {
         LOG(FATAL) << "Fail to new Controller";
         return;
     }
+
+	// 响应发送对象，析构的时候会发送响应给客户端
     HttpResponseSender resp_sender(cntl);
+
+	// 记录收到请求的时间
     resp_sender.set_received_us(msg->received_us());
 
+	// 判断版本号是否为2.0
     const bool is_http2 = imsg_guard->header().is_http2();
     if (is_http2) {
+		// http2.0使用流传输
         H2StreamContext* h2_sctx = static_cast<H2StreamContext*>(msg);
         resp_sender.set_h2_stream_id(h2_sctx->stream_id());
     }
 
+	// 用于访问controller的私有成员
     ControllerPrivateAccessor accessor(cntl);
+	
+	// 获取http请求头，请求体
     HttpHeader& req_header = cntl->http_request();
+	
+	// 将解析出来的http请求头放到controller中
     imsg_guard->header().Swap(req_header);
+	
     butil::IOBuf& req_body = imsg_guard->body();
 
     butil::EndPoint user_addr;
+	// 获取客户端的地址
     if (!GetUserAddressFromHeader(req_header, &user_addr)) {
         user_addr = socket->remote_side();
     }
@@ -1265,7 +1323,10 @@ void ProcessHttpRequest(InputMessageBase *msg) {
     }
 
     Span* span = NULL;
+
+	// 客户端请求的数据路径(uri)
     const std::string& path = req_header.uri().path();
+	
     const std::string* trace_id_str = req_header.GetHeader("x-bd-trace-id");
     if (IsTraceable(trace_id_str)) {
         uint64_t trace_id = 0;
@@ -1319,7 +1380,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         // `cntl', `req' and `res' will be deleted inside `done'
         return svc->CallMethod(md, cntl, NULL, NULL, done);
     }
-    
+
     const Server::MethodProperty* const sp =
         FindMethodPropertyByURI(path, server, &req_header._unresolved_path);
     if (NULL == sp) {
@@ -1380,6 +1441,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         return;
     }
 
+	// 获取对应Service的方法
     google::protobuf::Service* svc = sp->service;
     const google::protobuf::MethodDescriptor* method = sp->method;
     accessor.set_method(method);
@@ -1472,6 +1534,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         cntl->request_attachment().swap(req_body);
     }
 
+	// done会被传给用户定义的处理函数中，用于异步响应
     google::protobuf::Closure* done = new HttpResponseSenderAsDone(&resp_sender);
     imsg_guard.reset();  // optional, just release resourse ASAP
 
@@ -1482,6 +1545,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
     if (!FLAGS_usercode_in_pthread) {
         return svc->CallMethod(method, cntl, req, res, done);
     }
+	// 调用用户定义的处理函数，在done析构的时候响应会被发送
     if (BeginRunningUserCode()) {
         svc->CallMethod(method, cntl, req, res, done);
         return EndRunningUserCodeInPlace();

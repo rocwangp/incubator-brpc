@@ -342,6 +342,8 @@ enum LinkerInitialized { LINKER_INITIALIZED };
 // ptr:     the pointer to the member.
 // type:    the type of the container struct this is embedded in.
 // member:  the name of the member within the struct.
+
+// 根据成员变量的地址找到所在struct的地址
 #ifndef container_of
 # define container_of(ptr, type, member) ({                             \
             const BAIDU_TYPEOF( ((type *)0)->member ) *__mptr = (ptr);  \

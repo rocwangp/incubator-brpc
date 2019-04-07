@@ -437,6 +437,7 @@ ssize_t HttpMessage::ParseFromArray(const char *data, const size_t length) {
     return nprocessed;
 }
 
+// 解析IOBuf中的数据
 ssize_t HttpMessage::ParseFromIOBuf(const butil::IOBuf &buf) {
     if (Completed()) {
         if (buf.empty()) {
@@ -541,9 +542,12 @@ void MakeRawHttpRequest(butil::IOBuf* request,
                         const butil::EndPoint& remote_side,
                         const butil::IOBuf* content) {
     butil::IOBufBuilder os;
+	// 请求method
     os << HttpMethod2Str(h->method()) << ' ';
+	// 请求uri
     const URI& uri = h->uri();
     uri.PrintWithoutHost(os); // host is sent by "Host" header.
+    // 版本
     os << " HTTP/" << h->major_version() << '.'
        << h->minor_version() << BRPC_CRLF;
     if (h->method() != HTTP_METHOD_GET) {

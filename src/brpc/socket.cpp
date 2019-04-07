@@ -321,10 +321,13 @@ const uint32_t MAX_PIPELINED_COUNT = 32768;
 
 struct BAIDU_CACHELINE_ALIGNMENT Socket::WriteRequest {
     static WriteRequest* const UNCONNECTED;
-    
+
+	// 待发送的数据缓冲区
     butil::IOBuf data;
+	// 下一个发送请求
     WriteRequest* next;
     bthread_id_t id_wait;
+	// 发送的Socket对象
     Socket* socket;
     
     uint32_t pipelined_count() const {
@@ -486,10 +489,15 @@ Socket::~Socket() {
     bthread::butex_destroy(_epollout_butex);
 }
 
+// 发送成功后调用
 void Socket::ReturnSuccessfulWriteRequest(Socket::WriteRequest* p) {
     DCHECK(p->data.empty());
+	// 记录发送的Message个数
     AddOutputMessages(1);
     const bthread_id_t id_wait = p->id_wait;
+
+	// WriteRequest是从对象池中分配出来的
+	// 数据发送完成后，就可以将其归还到对象池中了
     butil::return_object(p);
     if (id_wait != INVALID_BTHREAD_ID) {
         NotifyOnFailed(id_wait);
@@ -575,6 +583,8 @@ int Socket::ResetFileDescriptor(int fd) {
     // OK to fail, namely unix domain socket does not support this.
     // NO-DELAY 关闭nagling算法
     butil::make_no_delay(fd);
+
+	// Type-Of-Service，设置IP头的某个标志位
     if (_tos > 0 &&
         setsockopt(fd, IPPROTO_IP, IP_TOS, &_tos, sizeof(_tos)) < 0) {
         PLOG(FATAL) << "Fail to set tos of fd=" << fd << " to " << _tos;
@@ -628,16 +638,30 @@ int Socket::Create(const SocketOptions& options, SocketId* id) {
     }
     s_vars->nsocket << 1;
     CHECK(NULL == m->_shared_part.load(butil::memory_order_relaxed));
+
+	// 记录当前未处理的请求数，每当被epoll激活时就加一，每次处理完就减一
+	// 实际处理过程中，如果加一之前非0，说明正在处理，不必重复调用处理函数
     m->_nevent.store(0, butil::memory_order_relaxed);
+
+	// bthread相关
     m->_keytable_pool = options.keytable_pool;
+
+	// type-of-service，用于设置ip头的TOS标志位
     m->_tos = 0;
+
+	// 对端地址
     m->_remote_side = options.remote_side;
+	
 	// epoll事件的回调函数
     m->_on_edge_triggered_events = options.on_edge_triggered_events;
+	
 	// Socket所属的对象，如Acceptor
     m->_user = options.user;
+
+	// 自定义的连接
     m->_conn = options.conn;
     m->_app_connect = options.app_connect;
+	
     // nref can be non-zero due to concurrent AddressSocket().
     // _this_id will only be used in destructor/Destroy of referenced
     // slots, which is safe and properly fenced. Although it's better
@@ -645,13 +669,25 @@ int Socket::Create(const SocketOptions& options, SocketId* id) {
     m->_this_id = MakeSocketId(
             VersionOfVRef(m->_versioned_ref.fetch_add(
                     1, butil::memory_order_release)), slot);
+	
+	// 当前Socket所在的连接更倾向的协议id
+	// 收到消息时会首先尝试这个id表示的协议，如果解析(处理)失败才会遍历其它的协议
     m->_preferred_index = -1;
+	
     m->_hc_count = 0;
+
+	// 接收缓冲区为空
     CHECK(m->_read_buf.empty());
+
+	// 上一次收到数据的时间为创建Socket的时间
     const int64_t cpuwide_now = butil::cpuwide_time_us();
     m->_last_readtime_us.store(cpuwide_now, butil::memory_order_relaxed);
+	
     m->reset_parsing_context(options.initial_parsing_context);
+
+	// RPC ID
     m->_correlation_id = 0;
+	
     m->_health_check_interval_s = options.health_check_interval_s;
     m->_ninprocess.store(1, butil::memory_order_relaxed);
     m->_auth_flag_error.store(0, butil::memory_order_relaxed);
@@ -1228,10 +1264,12 @@ int Socket::Connect(const timespec* abstime,
     if (_ssl_ctx) {
         _ssl_state = SSL_CONNECTING;
     } else {
+    // 关闭SSL连接属性，只使用普通的tcp连接
         _ssl_state = SSL_OFF;
     }
 
-	// 创建socket fd
+	// 如果需要连接服务器，说明当期Socket没有绑定套接字fd
+	// 创建fd，用于connect
     butil::fd_guard sockfd(socket(AF_INET, SOCK_STREAM, 0));
     if (sockfd < 0) {
         PLOG(ERROR) << "Fail to create socket";
@@ -1256,6 +1294,7 @@ int Socket::Connect(const timespec* abstime,
         PLOG(WARNING) << "Fail to connect to " << remote_side();
         return -1;
     }
+	// 有连接回调时的流程
     if (on_connect) {
 		// 当连接建立或者出错，fd会变为可读，所以监听可读事件
         EpollOutRequest* req = new(std::nothrow) EpollOutRequest;
@@ -1267,13 +1306,16 @@ int Socket::Connect(const timespec* abstime,
         req->fd = sockfd;
         req->timer_id = 0;
         req->on_epollout_event = on_connect;
+		// data是实际的请求对象，已经关联到当前的Socket
+		// 但是Socket并没有和fd关联
         req->data = data;
+		
         // A temporary Socket to hold `EpollOutRequest', which will
         // be added into epoll device soon
         SocketId connect_id;
         SocketOptions options;
         options.user = req;
-		// 创建一个Socket对象
+		// 创建一个Socket对象，和EpollOutRequest关联
         if (Socket::Create(options, &connect_id) != 0) {
             LOG(FATAL) << "Fail to create Socket";
             delete req;
@@ -1282,13 +1324,16 @@ int Socket::Connect(const timespec* abstime,
         // From now on, ownership of `req' has been transferred to
         // `connect_id'. We hold an additional reference here to
         // ensure `req' to be valid in this scope
+        // 找到和EPOLLRequest关联的Socket
         SocketUniquePtr s;
         CHECK_EQ(0, Socket::Address(connect_id, &s));
 
         // Add `sockfd' into epoll so that `HandleEpollOutRequest' will
         // be called with `req' when epoll event reaches
 
-		// 将sockfd添加到EPOLL中
+		// 获取EPOLL调度器，将sockfd添加到EPOLL中
+		// epoll_event会保存fd和id，在fd被激活后，可以通过id找到Socket，进而找到与之关联的EpollOutRequest
+		// 最后在EPOLLOutRequest中找到WriteRequest和on_connect回调
         if (GetGlobalEventDispatcher(sockfd).
             AddEpollOut(connect_id, sockfd, false) != 0) {
             const int saved_errno = errno;
@@ -1369,6 +1414,8 @@ int Socket::ConnectIfNot(const timespec* abstime, WriteRequest* req) {
     // 根据当前Socket对象创建SocketUniquePtr
     SocketUniquePtr s;
     ReAddress(&s);
+
+	// 请求和Socket绑定
     req->socket = s.get();
     if (_conn) {
         if (_conn->Connect(this, abstime, KeepWriteIfConnected, req) < 0) {
@@ -1384,6 +1431,8 @@ int Socket::ConnectIfNot(const timespec* abstime, WriteRequest* req) {
     return 1;    
 }
 
+// 根据id找到对应的Socket对象，进而找到与之关联的EpollOutRequest
+// 从EpollOutRequest中可以找到on_connect和WriteRequest
 int Socket::HandleEpollOut(SocketId id) {
     SocketUniquePtr s;
     // Since Sockets might have been `SetFailed' before they were
@@ -1421,6 +1470,7 @@ void Socket::HandleEpollOutTimeout(void* arg) {
     s->HandleEpollOutRequest(ETIMEDOUT, req);
 }
 
+// 处理epoll out事件
 int Socket::HandleEpollOutRequest(int error_code, EpollOutRequest* req) {
     // Only one thread can `SetFailed' this `Socket' successfully
     // Also after this `req' will be destroyed when its reference
@@ -1431,12 +1481,17 @@ int Socket::HandleEpollOutRequest(int error_code, EpollOutRequest* req) {
     // We've got the right to call user callback
     // The timer will be removed inside destructor of EpollOutRequest
     GetGlobalEventDispatcher(req->fd).RemoveEpollOut(id(), req->fd, false);
+
+	// on_epollout_event为on_connect(KeepWriteIfConnected)
+	// req->data为WriteRequest
     return req->on_epollout_event(req->fd, error_code, req->data);
 }
 
 // 创建后台协程，发送数据
 void Socket::AfterAppConnected(int err, void* data) {
     WriteRequest* req = static_cast<WriteRequest*>(data);
+
+	// 连接成功，创建协程写入数据
     if (err == 0) {
         Socket* const s = req->socket;
         SharedPart* sp = s->GetSharedPart();
@@ -1478,7 +1533,7 @@ static void* RunClosure(void* arg) {
     return NULL;
 }
 
-// connect之后fd可读时的回调函数
+// connect之后fd可写时的回调函数
 int Socket::KeepWriteIfConnected(int fd, int err, void* data) {
     WriteRequest* req = static_cast<WriteRequest*>(data);
     Socket* s = req->socket;
@@ -1592,6 +1647,7 @@ int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
         return SetError(opt.id_wait, ENOMEM);
     }
 
+	// 将要发送的数据保存在WriteRequest中
     req->data.swap(*data);
     // Set `req->next' to UNCONNECTED so that the KeepWrite thread will
     // wait until it points to a valid WriteRequest or NULL.
@@ -1743,13 +1799,21 @@ void* Socket::KeepWrite(void* void_arg) {
     WriteRequest* cur_tail = NULL;
     do {
         // req was written, skip it.
+        // WriteRequest是一个链表，next有三种状态
+        // 1. UNCONNECTED: 表示连接未建立，需要先建立连接再发送请求
+        // 2. NULL: 表示只有一个请求需要发送
+        // 3. !NULL: 多个请求等待发送
         if (req->next != NULL && req->data.empty()) {
             WriteRequest* const saved_req = req;
             req = req->next;
+			// 直接调用发送成功的回调
             s->ReturnSuccessfulWriteRequest(saved_req);
         }
+
+		// 将WriteRequest中的数据写到fd中(批量写)
         const ssize_t nw = s->DoWrite(req);
         if (nw < 0) {
+			// 写入失败
             if (errno != EAGAIN && errno != EOVERCROWDED) {
                 const int saved_errno = errno;
                 PLOG(WARNING) << "Fail to keep-write into " << *s;
@@ -1758,9 +1822,13 @@ void* Socket::KeepWrite(void* void_arg) {
                 break;
             }
         } else {
+        	// 记录写入的字节数
             s->AddOutputBytes(nw);
         }
         // Release WriteRequest until non-empty data or last request.
+
+		// 待发送的数据是若干个WriteRequest形成的链表
+		// 遍历链表，将发送完成的WriteRequest归还到对象池中
         while (req->next != NULL && req->data.empty()) {
             WriteRequest* const saved_req = req;
             req = req->next;
@@ -1790,12 +1858,16 @@ void* Socket::KeepWrite(void* void_arg) {
                 break;
             }
         }
+
+		// 找到剩余未发送的WriteRequest的最后一个节点
         if (NULL == cur_tail) {
             for (cur_tail = req; cur_tail->next != NULL;
                  cur_tail = cur_tail->next);
         }
         // Return when there's no more WriteRequests and req is completely
         // written.
+
+		// 如果所有请求都发送完毕，将最后一个WriteRequest归还到对象池
         if (s->IsWriteComplete(cur_tail, (req == cur_tail), &cur_tail)) {
             CHECK_EQ(cur_tail, req);
             s->ReturnSuccessfulWriteRequest(req);
@@ -1804,10 +1876,13 @@ void* Socket::KeepWrite(void* void_arg) {
     } while (1);
 
     // Error occurred, release all requests until no new requests.
+
+	// 向fd发送数据失败
     s->ReleaseAllFailedWriteRequests(req);
     return NULL;
 }
 
+// 将WriteRequest中的数据写入到fd中
 ssize_t Socket::DoWrite(WriteRequest* req) {
     // Group butil::IOBuf in the list into a batch array.
     butil::IOBuf* data_list[DATA_LIST_MAX];
@@ -1819,11 +1894,13 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
         data_list[ndata++] = &p->data;
     }
 
+	// SSL_OFF表示不开启SSL连接
     if (ssl_state() == SSL_OFF) {
         // Write IOBuf in the batch array into the fd.
         if (_conn) {
             return _conn->CutMessageIntoFileDescriptor(fd(), data_list, ndata);
         } else {
+        	// 将数据批量写到fd中
             ssize_t nw = butil::IOBuf::cut_multiple_into_file_descriptor(
                 fd(), data_list, ndata);
             return nw;
@@ -2094,6 +2171,9 @@ int Socket::StartInputEvent(SocketId id, uint32_t events,
     // error as well, we don't pass the events.
 
 	// 记录Socket被激活的事件数量
+	// 如果fetch_add返回0，说明在这之前没有事件到来，所以需要去处理fd的数据
+	// 如果fetch_add返回大于0，说明在这之前来过数据，此时可能正在被处理，所以不需要重复进入
+	// 在处理的流程中会判断_nevent的值来处理这次的数据
     if (s->_nevent.fetch_add(1, butil::memory_order_acq_rel) == 0) {
         // According to the stats, above fetch_add is very effective. In a
         // server processing 1 million requests per second, this counter

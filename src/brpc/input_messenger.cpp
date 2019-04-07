@@ -191,7 +191,7 @@ void InputMessenger::OnNewMessages(Socket* m) {
     // - Verify will always be called in this bthread at most once and before
     //   any process.
 
-	// 所有Socket的user都是Acceptor，handlers是在BuildAcceptor中初始化的
+	// 对于服务器而言，所有Socket的user都是Acceptor，handlers是在BuildAcceptor中初始化的
     InputMessenger* messenger = static_cast<InputMessenger*>(m->user());
 	// handlers保存了当前Service上的所有protocols
     const InputMessageHandler* handlers = messenger->_handlers;

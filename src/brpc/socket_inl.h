@@ -222,6 +222,12 @@ inline bool Socket::Failed() const {
         != VersionOfSocketId(_this_id);
 }
 
+// 判断fd是否仍然有可读事件进行处理
+// progress是当前已经处理的请求数，nevent是总共到来的请求数
+// 当请求到来时，nevent会原子加一
+// 比较nevent和*process的值
+// 如果相等，说明所有请求都已经处理完成，将nevent赋值为0退出
+// 如果不相等，则一定是nevent > *progress，说明还有请求没有处理，将*progress赋值为nevent
 inline bool Socket::MoreReadEvents(int* progress) {
     // Fail to CAS means that new events arrived.
     return !_nevent.compare_exchange_strong(

@@ -678,6 +678,7 @@ parse_url_char(enum state s, const char ch)
   return s_dead;
 }
 
+// 解析http消息包
 size_t http_parser_execute (http_parser *parser,
                             const http_parser_settings *settings,
                             const char *data,
@@ -697,6 +698,7 @@ size_t http_parser_execute (http_parser *parser,
     return 0;
   }
 
+  // 收到的消息长度为0
   if (len == 0) {
     switch (parser->state) {
       case s_body_identity_eof:

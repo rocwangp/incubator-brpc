@@ -1081,20 +1081,32 @@ ssize_t IOBuf::cut_multiple_into_SSL_channel(SSL* ssl, IOBuf* const* pieces,
     return nw;
 }
 
+// 将IOBuf*数组中的数据批量写入到fd中
+// count: IOBuf*数组个数
 ssize_t IOBuf::pcut_multiple_into_file_descriptor(
     int fd, off_t offset, IOBuf* const* pieces, size_t count) {
     if (BAIDU_UNLIKELY(count == 0)) {
         return 0;
     }
+	// 只有一个IOBuf*，直接写
     if (1UL == count) {
         return pieces[0]->pcut_into_file_descriptor(fd, offset);
     }
+
+	// 使用iovec进行批量写入操作
     struct iovec vec[IOBUF_IOV_MAX];
+	// 记录使用的iovec数组个数
     size_t nvec = 0;
     for (size_t i = 0; i < count; ++i) {
         const IOBuf* p = pieces[i];
+		// IOBuf有两种存储形式
+		// SmallView: 由两个BlockRef组成，每个BlockRef指向一个Block，是一段连续内存
+		// BigView: 由多个BlockRef组成
+
+		// ref_num获取BlockRef个数
         const size_t nref = p->_ref_num();
         for (size_t j = 0; j < nref && nvec < IOBUF_IOV_MAX; ++j, ++nvec) {
+			// 获取指定的BlockRef，找到对应Block数据的存储位置
             IOBuf::BlockRef const& r = p->_ref_at(j);
             vec[nvec].iov_base = r.block->data + r.offset;
             vec[nvec].iov_len = r.length;
@@ -1106,6 +1118,7 @@ ssize_t IOBuf::pcut_multiple_into_file_descriptor(
         static iobuf::iov_function pwritev_func = iobuf::get_pwritev_func();
         nw = pwritev_func(fd, vec, nvec, offset);
     } else {
+		// 批量写入
         nw = ::writev(fd, vec, nvec);
     }
     if (nw <= 0) {
