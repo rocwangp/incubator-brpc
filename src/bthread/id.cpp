@@ -322,19 +322,23 @@ static int id_create_impl(
     bthread_id_t* id, void* data,
     int (*on_error)(bthread_id_t, void*, int),
     int (*on_error2)(bthread_id_t, void*, int, const std::string&)) {
+    // 从对象池中分配一个Id类型的对象
     IdResourceId slot;
     Id* const meta = get_resource(&slot);
     if (meta) {
+		// 保存用户数据data和错误处理函数
         meta->data = data;
         meta->on_error = on_error;
         meta->on_error2 = on_error2;
         CHECK(meta->pending_q.empty());
+		// 初始时，butex为0，改成1
         uint32_t* butex = meta->butex;
         if (0 == *butex || *butex + ID_MAX_RANGE + 2 < *butex) {
             // Skip 0 so that bthread_id_t is never 0
             // avoid overflow to make comparisons simpler.
             *butex = 1;
         }
+		// join_butex用于锁
         *meta->join_butex = *butex;
         meta->first_ver = *butex;
         meta->locked_ver = *butex + 1;
@@ -381,6 +385,7 @@ static int id_create_ranged_impl(
 
 extern "C" {
 
+// 创建一个id，并将数据data和id进行绑定
 int bthread_id_create(
     bthread_id_t* id, void* data,
     int (*on_error)(bthread_id_t, void*, int)) {
@@ -398,17 +403,21 @@ int bthread_id_create_ranged(bthread_id_t* id, void* data,
         NULL, range);
 }
 
+// 上锁
 int bthread_id_lock_and_reset_range_verbose(
     bthread_id_t id, void **pdata, int range, const char *location) {
+    // 根据id从对象池中找到Id对象
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
     }
+
     const uint32_t id_ver = bthread::get_version(id);
     uint32_t* butex = meta->butex;
     bool ever_contended = false;
     meta->mutex.lock();
     while (meta->has_version(id_ver)) {
+		// 没有上锁，直接上锁返回
         if (*butex == meta->first_ver) {
             // contended locker always wakes up the butex at unlock.
             meta->lock_location = location;
@@ -432,10 +441,13 @@ int bthread_id_lock_and_reset_range_verbose(
             }
             return 0;
         } else if (*butex != meta->unlockable_ver()) {
+		// 已经有其它协程上了锁，需要将当前协程挂起等待Unlock
+		// contended_ver表示上锁
             *butex = meta->contended_ver();
             uint32_t expected_ver = *butex;
             meta->mutex.unlock();
             ever_contended = true;
+		// 将当前协程加到这个锁的等待队列中，在unlock函数中会唤醒等待的协程
             if (bthread::butex_wait(butex, expected_ver, NULL) < 0 &&
                 errno != EWOULDBLOCK && errno != EINTR) {
                 return errno;
@@ -560,7 +572,9 @@ int bthread_id_lock_verbose(bthread_id_t id, void** pdata,
     return bthread_id_lock_and_reset_range_verbose(id, pdata, 0, location);
 }
 
+// 解锁
 int bthread_id_unlock(bthread_id_t id) {
+	// 从对象池中取出id对应的Id对象
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -575,6 +589,7 @@ int bthread_id_unlock(bthread_id_t id) {
         LOG(FATAL) << "Invalid bthread_id=" << id.value;
         return EINVAL;
     }
+	// 如果根本没有上锁，直接返回，不需要解锁
     if (*butex == meta->first_ver) {
         meta->mutex.unlock();
         LOG(FATAL) << "bthread_id=" << id.value << " is not locked!";
@@ -591,10 +606,16 @@ int bthread_id_unlock(bthread_id_t id) {
                                    front.error_text);
         }
     } else {
+    	// 如果在锁定期间有其它协程调用lock，那么会阻塞到等待队列中
+		// 在unlock中就需要遍历等待的协程，将其唤醒
+
+		// *butex == contended_ver表示存在协程在当前协程锁定期间上锁
         const bool contended = (*butex == meta->contended_ver());
+		// 解锁后，*butex等于first_vec
         *butex = meta->first_ver;
         meta->mutex.unlock();
         if (contended) {
+			// 唤醒一个等待的协程
             // We may wake up already-reused id, but that's OK.
             bthread::butex_wake(butex);
         }

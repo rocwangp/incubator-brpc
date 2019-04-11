@@ -258,10 +258,12 @@ inline TaskGroup* get_task_group(TaskControl* c) {
     return g ? g : c->choose_one_group();
 }
 
+// 唤醒一个等待在锁上的协程
 int butex_wake(void* arg) {
     Butex* b = container_of(static_cast<butil::atomic<int>*>(arg), Butex, value);
     ButexWaiter* front = NULL;
     {
+    	// 从等待链表中弹出一个ButexBthreadWaiter对象
         BAIDU_SCOPED_LOCK(b->waiter_lock);
         if (b->waiters.empty()) {
             return 0;
@@ -275,7 +277,11 @@ int butex_wake(void* arg) {
         return 1;
     }
     ButexBthreadWaiter* bbw = static_cast<ButexBthreadWaiter*>(front);
+
+	// 是否需要sleep
     unsleep_if_necessary(bbw, get_global_timer_thread());
+
+	// 调度对应的协程(tid)
     TaskGroup* g = tls_task_group;
     if (g) {
         TaskGroup::exchange(&g, bbw->tid);
@@ -285,10 +291,14 @@ int butex_wake(void* arg) {
     return 1;
 }
 
+// 唤醒所有等待锁上的协程
 int butex_wake_all(void* arg) {
     Butex* b = container_of(static_cast<butil::atomic<int>*>(arg), Butex, value);
 
+	// 等待在锁上的bthread
     ButexWaiterList bthread_waiters;
+
+	// 等待在锁上的pthread
     ButexWaiterList pthread_waiters;
     {
         BAIDU_SCOPED_LOCK(b->waiter_lock);
@@ -296,6 +306,7 @@ int butex_wake_all(void* arg) {
             ButexWaiter* bw = b->waiters.head()->value();
             bw->RemoveFromList();
             bw->container.store(NULL, butil::memory_order_relaxed);
+			// tid存在则表示bthread，否则是pthread
             if (bw->tid) {
                 bthread_waiters.Append(bw);
             } else {
@@ -305,17 +316,24 @@ int butex_wake_all(void* arg) {
     }
 
     int nwakeup = 0;
+
+	// 遍历每个pthread waiters，唤醒对应的pthread
     while (!pthread_waiters.empty()) {
+		// 找到链表的头节点
         ButexPthreadWaiter* bw = static_cast<ButexPthreadWaiter*>(
             pthread_waiters.head()->value());
+		// 将该节点移除
         bw->RemoveFromList();
+		// 唤醒这个节点代表的pthread
         wakeup_pthread(bw);
+		// 记录唤醒的个数
         ++nwakeup;
     }
     if (bthread_waiters.empty()) {
         return nwakeup;
     }
     // We will exchange with first waiter in the end.
+
     ButexBthreadWaiter* next = static_cast<ButexBthreadWaiter*>(
         bthread_waiters.head()->value());
     next->RemoveFromList();
@@ -323,6 +341,8 @@ int butex_wake_all(void* arg) {
     ++nwakeup;
     TaskGroup* g = get_task_group(next->control);
     const int saved_nwakeup = nwakeup;
+
+	// 遍历每个ButexBthreadWaiter，唤醒对应的协程
     while (!bthread_waiters.empty()) {
         // pop reversely
         ButexBthreadWaiter* w = static_cast<ButexBthreadWaiter*>(
@@ -511,6 +531,7 @@ static void wait_for_butex(void* arg) {
             bw->waiter_state = WAITER_STATE_UNMATCHEDVALUE;
         } else if (bw->waiter_state == WAITER_STATE_READY/*1*/ &&
                    !bw->task_meta->interrupted) {
+            // 将当前协程加入到锁的等待队列中(链表)
             b->waiters.Append(bw);
             bw->container.store(b, butil::memory_order_relaxed);
             return;
@@ -604,6 +625,7 @@ static int butex_wait_from_pthread(TaskGroup* g, Butex* b, int expected_value,
     return rc;
 }
 
+// 等待锁被unlock
 int butex_wait(void* arg, int expected_value, const timespec* abstime) {
     Butex* b = container_of(static_cast<butil::atomic<int>*>(arg), Butex, value);
     if (b->value.load(butil::memory_order_relaxed) != expected_value) {

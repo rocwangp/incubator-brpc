@@ -140,6 +140,7 @@ Channel::~Channel() {
     }
 }
 
+// 根据配置项设置Channel使用的协议，将处理消息的方法进行保存
 int Channel::InitChannelOptions(const ChannelOptions* options) {
     if (options) {  // Override default options if user provided one.
         _options = *options;
@@ -179,6 +180,7 @@ int Channel::InitChannelOptions(const ChannelOptions* options) {
         }
     }
 
+	// 客户端使用该协议发送消息，自然用这个协议解析响应
     _preferred_index = get_client_side_messenger()->FindProtocolIndex(_options.protocol);
     if (_preferred_index < 0) {
         LOG(ERROR) << "Fail to get index for protocol="
@@ -320,14 +322,21 @@ int Channel::InitSingle(const butil::EndPoint& server_addr_and_port,
     return 0;
 }
 
+// ns_url: server url, 如0.0.0.0:8000
+// lb_name: load balancing algorithm，如rr
 int Channel::Init(const char* ns_url,
                   const char* lb_name,
                   const ChannelOptions* options) {
+    // lb没空，不使用
     if (lb_name == NULL || *lb_name == '\0') {
         // Treat ns_url as server_addr_and_port
         return Init(ns_url, options);
     }
+
+	// 加载全局对象(协议，LB)
     GlobalInitializeOrDie();
+
+	// 设置协议相关选项，保存为成员变量
     if (InitChannelOptions(options) != 0) {
         return -1;
     }
@@ -350,6 +359,8 @@ int Channel::Init(const char* ns_url,
     if (CreateSocketSSLContext(_options, &ns_opt.ssl_ctx) != 0) {
         return -1;
     }
+
+	// 初始化Load Balancer
     if (lb->Init(ns_url, lb_name, _options.ns_filter, &ns_opt) != 0) {
         LOG(ERROR) << "Fail to initialize LoadBalancerWithNaming";
         delete lb;
@@ -405,6 +416,8 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     if (_options.enable_circuit_breaker) {
         cntl->add_flag(Controller::FLAGS_ENABLED_CIRCUIT_BREAKER);
     }
+
+	// 为Controller创建一个唯一id
     const CallId correlation_id = cntl->call_id();
     const int rc = bthread_id_lock_and_reset_range(
                     correlation_id, NULL, 2 + cntl->max_retry());

@@ -536,6 +536,7 @@ static void HandleTimeout(void* arg) {
     bthread_id_error(correlation_id, ERPCTIMEDOUT);
 }
 
+// 在收到响应后调用
 void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
                                         bool new_bthread, int saved_error) {
     // TODO(gejun): Simplify call-ending code.
@@ -558,6 +559,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
         return;
     }
 
+	// 超过重试次数
     if ((!_error_code && _retry_policy == NULL) ||
         _current_call.nretry >= _max_retry) {
         goto END_OF_RPC;
@@ -625,7 +627,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
         return IssueRPC(butil::gettimeofday_us());
     }
     
-END_OF_RPC:
+ END_OF_RPC:
     if (new_bthread) {
         // [ Essential for -usercode_in_pthread=true ]
         // When -usercode_in_pthread is on, the reserved threads (set by
@@ -712,6 +714,8 @@ void Controller::Call::OnComplete(
         }
     }
 
+	// 在CallMethod时，根据不同的connection_type创建不同的Socket
+	// 在收到响应后也要根据connection_type来归还Socket
     switch (c->connection_type()) {
     case CONNECTION_TYPE_UNKNOWN:
         break;
@@ -789,6 +793,9 @@ void Controller::Call::OnComplete(
 }
 
 void Controller::EndRPC(const CompletionInfo& info) {
+
+	// 在Channel::CallMethod函数中，会设置定时器来判断请求是否超时
+	// 当响应已经返回时，定时器就需要删掉
     if (_timeout_id != 0) {
         bthread_timer_del(_timeout_id);
         _timeout_id = 0;
@@ -967,6 +974,8 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     // call_id + N + 1 : retry N
     // All ids except call_id are versioned. Say if we've sent retry 1 and
     // a failed response of first try comes back, it will be ignored.
+
+	// cid.value会和Socket对象进行绑定，以确保在收到响应的时候根据Socket::correlation_id找到这个Controller
     const CallId cid = current_id();
 
     // Intercept IssueRPC when _sender is set. Currently _sender is only set

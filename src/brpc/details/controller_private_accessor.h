@@ -40,6 +40,7 @@ public:
         _cntl = cntl;
     }
 
+	// 在收到响应后调用
     void OnResponse(CallId id, int saved_error) {
         const Controller::CompletionInfo info = { id, true };
         _cntl->OnVersionedRPCReturned(info, false, saved_error);

@@ -25,6 +25,8 @@ LoadBalancerWithNaming::~LoadBalancerWithNaming() {
     }
 }
 
+// ns_url: 服务器地址
+// lb_name: load算法
 int LoadBalancerWithNaming::Init(const char* ns_url, const char* lb_name,
                                  const NamingServiceFilter* filter,
                                  const GetNamingServiceThreadOptions* options) {

@@ -673,7 +673,8 @@ int Socket::Create(const SocketOptions& options, SocketId* id) {
 	// 当前Socket所在的连接更倾向的协议id
 	// 收到消息时会首先尝试这个id表示的协议，如果解析(处理)失败才会遍历其它的协议
     m->_preferred_index = -1;
-	
+
+	// 健康检查相关
     m->_hc_count = 0;
 
 	// 接收缓冲区为空
@@ -687,7 +688,8 @@ int Socket::Create(const SocketOptions& options, SocketId* id) {
 
 	// RPC ID
     m->_correlation_id = 0;
-	
+
+	// 健康检查间隔
     m->_health_check_interval_s = options.health_check_interval_s;
     m->_ninprocess.store(1, butil::memory_order_relaxed);
     m->_auth_flag_error.store(0, butil::memory_order_relaxed);
@@ -698,9 +700,12 @@ int Socket::Create(const SocketOptions& options, SocketId* id) {
         return -1;
     }
     // Disable SSL check if there is no SSL context
+
+	// tcp ssl认证状态，SSL_OFF表示不开启ssl认证
     m->_ssl_state = (options.initial_ssl_ctx == NULL ? SSL_OFF : SSL_UNKNOWN);
     m->_ssl_session = NULL;
     m->_ssl_ctx = options.initial_ssl_ctx;
+	
     m->_connection_type_for_progressive_read = CONNECTION_TYPE_UNKNOWN;
     m->_controller_released_socket.store(false, butil::memory_order_relaxed);
     m->_overcrowded = false;
@@ -894,6 +899,7 @@ int Socket::SetFailed(int error_code, const char* error_fmt, ...) {
         CHECK(false) << "error_code is 0";
         error_code = EFAILEDSOCKET;
     }
+	// 获取当前Socket的版本号
     const uint32_t id_ver = VersionOfSocketId(_this_id);
     uint64_t vref = _versioned_ref.load(butil::memory_order_relaxed);
     for (;;) {  // need iteration to retry compare_exchange_strong
@@ -902,12 +908,17 @@ int Socket::SetFailed(int error_code, const char* error_fmt, ...) {
         }
         // Try to set version=id_ver+1 (to make later Address() return NULL),
         // retry on fail.
+        // Socket是从对象池中取出的，不能直接delete掉
+        // 代替的方法是通过版本号来判断一个Socket是否已经被更改(过期)
+        // 当其他的流程需要访问它的Socket时(Socket::Address())，会通过版本号来判断是否已经被删掉
         if (_versioned_ref.compare_exchange_strong(
                 vref, MakeVRef(id_ver + 1, NRefOfVRef(vref)),
                 butil::memory_order_release,
                 butil::memory_order_relaxed)) {
             // Update _error_text
             std::string error_text;
+
+			// 解析错误信息
             if (error_fmt != NULL) {
                 va_list ap;
                 va_start(ap, error_fmt);
@@ -915,6 +926,7 @@ int Socket::SetFailed(int error_code, const char* error_fmt, ...) {
                 va_end(ap);
             }
             pthread_mutex_lock(&_id_wait_list_mutex);
+			// 保存错误码和错误信息
             _error_code = error_code;
             _error_text = error_text;
             pthread_mutex_unlock(&_id_wait_list_mutex);
@@ -930,6 +942,10 @@ int Socket::SetFailed(int error_code, const char* error_fmt, ...) {
                         circuit_breaker.isolation_duration_ms()));
             }
             // Wake up all threads waiting on EPOLLOUT when closing fd
+
+			// 如果没有设置epoll out的回调，那么会直接等待EPOLLOUT事件
+			// 在函数中通过epollout_butex挂起当前协程
+			// 所以在关闭Socket的时候要把所有因为epollout_butex挂起的协程激活
             _epollout_butex->fetch_add(1, butil::memory_order_relaxed);
             bthread::butex_wake_all(_epollout_butex);
 
@@ -1244,6 +1260,7 @@ int Socket::WaitEpollOut(int fd, bool pollin, const timespec* abstime) {
         return -1;
     }
 
+	// 阻塞等待连接结果，连接完成后_epollout_butex会被唤醒
     int rc = bthread::butex_wait(_epollout_butex, expected_val, abstime);
     const int saved_errno = errno;
     if (rc < 0 && errno == EWOULDBLOCK) {
@@ -1362,6 +1379,8 @@ int Socket::Connect(const timespec* abstime,
         }
         
     } else {
+    	// 如果没有设置连接回调，直接在connect操作后开始等待
+    	// 将fd添加到EPOLL中
         if (WaitEpollOut(sockfd, false, abstime) != 0) {
             PLOG(WARNING) << "Fail to wait EPOLLOUT of fd=" << sockfd;
             return -1;
@@ -1373,12 +1392,14 @@ int Socket::Connect(const timespec* abstime,
     return sockfd.release();
 }
 
+// 判断非阻塞connect是否成功(sockfd在可写之后调用)
 int Socket::CheckConnected(int sockfd) {    
     if (sockfd == STREAM_FAKE_FD) {
         return 0;
     }
     int err = 0;
     socklen_t errlen = sizeof(err);
+	// 查看SO_ERROR，非0说明失败
     if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0) {
         PLOG(ERROR) << "Fail to getsockopt of fd=" << sockfd; 
         return -1;
@@ -1391,6 +1412,7 @@ int Socket::CheckConnected(int sockfd) {
 
     struct sockaddr_in client;
     socklen_t size = sizeof(client);
+	// 获取连接使用的端口
     CHECK_EQ(0, getsockname(sockfd, (struct sockaddr*) &client, &size));
     LOG_IF(INFO, FLAGS_log_connected)
             << "Connected to " << remote_side()
@@ -1445,12 +1467,15 @@ int Socket::HandleEpollOut(SocketId id) {
     }
 
     EpollOutRequest* req = dynamic_cast<EpollOutRequest*>(s->user());
+	// 在ConnectIfNot函数中会尝试connect并将epoll_out和user绑定，表示有on_connect回调
     if (req != NULL) {
         return s->HandleEpollOutRequest(0, req);
     }
-    
+
     // Currently `WaitEpollOut' needs `_epollout_butex'
     // TODO(jiangrujie): Remove this in the future
+
+	// 没有回调的时候，connect流程阻塞在_epollout_butex上，连接完成后需要唤醒
     s->_epollout_butex->fetch_add(1, butil::memory_order_relaxed);
     bthread::butex_wake_except(s->_epollout_butex, 0);  
     return 0;
@@ -1693,6 +1718,7 @@ int Socket::Write(SocketMessagePtr<>& msg, const WriteOptions* options_in) {
     return StartWrite(req, opt);
 }
 
+// 将请求数据WriteRequest写入到fd中
 int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     // Release fence makes sure the thread getting request sees *req
     WriteRequest* const prev_head =
@@ -1945,6 +1971,7 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
 }
 
 int Socket::SSLHandshake(int fd, bool server_mode) {
+	// ssl_ctx为空表示普通的tcp连接，不需要ssl认证
     if (_ssl_ctx == NULL) {
         if (server_mode) {
             LOG(ERROR) << "Lack SSL configuration to handle SSL request";

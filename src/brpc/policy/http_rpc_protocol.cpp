@@ -247,22 +247,34 @@ static bool RemoveGrpcPrefix(butil::IOBuf* body, bool* compressed) {
     return (message_length + 5 == sz);
 }
 
+// 收到http响应的处理函数
 void ProcessHttpResponse(InputMessageBase* msg) {
     const int64_t start_parse_us = butil::cpuwide_time_us();
     DestroyingPtr<HttpContext> imsg_guard(static_cast<HttpContext*>(msg));
+
+	// 获取收到响应的Socket对象
     Socket* socket = imsg_guard->socket();
+
+	// 在发送请求前，已经将Controller::callid和Socket::correlation_id进行绑定
+	// 所以在收到响应时可以根据Socket::correlation_id找到Controller对象
     uint64_t cid_value;
+
+	// 查看http版本号，判断是否是http2.0
     const bool is_http2 = imsg_guard->header().is_http2();
     if (is_http2) {
+		// http2.0使用流
         H2StreamContext* h2_sctx = static_cast<H2StreamContext*>(msg);
         cid_value = h2_sctx->correlation_id();
     } else {
         cid_value = socket->correlation_id();
     }
+
+	// 没有找到与Socket关联的Controller，直接返回
     if (cid_value == 0) {
         LOG(WARNING) << "Fail to find correlation_id from " << *socket;
         return;
     }
+	// 根据callid找到对应的Controller对象
     const bthread_id_t cid = { cid_value };
     Controller* cntl = NULL;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
@@ -272,6 +284,7 @@ void ProcessHttpResponse(InputMessageBase* msg) {
         return;
     }
 
+	// Controller私有成员访问包装
     ControllerPrivateAccessor accessor(cntl);
 
     Span* span = accessor.span();
@@ -283,24 +296,35 @@ void ProcessHttpResponse(InputMessageBase* msg) {
         span->set_start_parse_us(start_parse_us);
     }
 
+	// 将http响应存放到Controller中
     HttpHeader* res_header = &cntl->http_response();
+    // 在http解析之后，响应存放在imsg_guard中，交换到Controller中
     res_header->Swap(imsg_guard->header());
+
+	// 获取响应body
     butil::IOBuf& res_body = imsg_guard->body();
     CHECK(cntl->response_attachment().empty());
     const int saved_error = cntl->ErrorCode();
 
     bool is_grpc_ct = false;
+
+	// 获取http文本类型
     const HttpContentType content_type =
         ParseContentType(res_header->content_type(), &is_grpc_ct);
+
+	// 判断是否是grpc协议文本
     const bool is_grpc = (is_http2 && is_grpc_ct);
+	// 是否压缩
     bool grpc_compressed = false;  // only valid when is_grpc is true.
     
     do {
         if (!is_http2) {
             // If header has "Connection: close", close the connection.
+            // 获取连接类型(Connection: close/keep-alive)
             const std::string* conn_cmd = res_header->GetHeader(common->CONNECTION);
             if (conn_cmd != NULL && 0 == strcasecmp(conn_cmd->c_str(), "close")) {
                 // Server asked to close the connection.
+                // 如果是短连接，则直接将Socket断开
                 if (imsg_guard->read_body_progressively()) {
                     // Close the socket when reading completes.
                     socket->read_will_be_progressive(CONNECTION_TYPE_SHORT);
@@ -363,6 +387,8 @@ void ProcessHttpResponse(InputMessageBase* msg) {
         
         // Fail RPC if status code is an error in http sense.
         // ErrorCode of RPC is unified to EHTTP.
+
+		// 处理响应码
         const int sc = res_header->status_code();
         if (sc < 200 || sc >= 300) {
             std::string err = butil::string_printf(
@@ -397,6 +423,7 @@ void ProcessHttpResponse(InputMessageBase* msg) {
             break;
         }
 
+		// 处理http编码
         const std::string* encoding = NULL;
         if (is_grpc) {
             if (grpc_compressed) {
@@ -410,32 +437,44 @@ void ProcessHttpResponse(InputMessageBase* msg) {
         } else {
             encoding = res_header->GetHeader(common->CONTENT_ENCODING);
         }
+		// gzip压缩
         if (encoding != NULL && *encoding == common->GZIP) {
             TRACEPRINTF("Decompressing response=%lu",
                         (unsigned long)res_body.size());
             butil::IOBuf uncompressed;
+
+			// gzip解压
             if (!policy::GzipDecompress(res_body, &uncompressed)) {
                 cntl->SetFailed(ERESPONSE, "Fail to un-gzip response body");
                 break;
             }
+
+			// 为响应消息赋值(swap)
             res_body.swap(uncompressed);
         }
+
+		// protobuf反序列化，将解析后的响应存放到Controller::response中
         if (content_type == HTTP_CONTENT_PROTO) {
+
+			// 将res_body使用protobuf反序列化，保存到Controller::response中
             if (!ParsePbFromIOBuf(cntl->response(), res_body)) {
                 cntl->SetFailed(ERESPONSE, "Fail to parse content");
                 break;
             }
         } else if (content_type == HTTP_CONTENT_JSON) {
+       // json反序列化，将解析后的响应存放到Controller::response中
             // message body is json
             butil::IOBufAsZeroCopyInputStream wrapper(res_body);
             std::string err;
             json2pb::Json2PbOptions options;
             options.base64_to_bytes = cntl->has_pb_bytes_to_base64();
+			// 将res_body使用protobuf反序列化，保存到Controller::response中
             if (!json2pb::JsonToProtoMessage(&wrapper, cntl->response(), options, &err)) {
                 cntl->SetFailed(ERESPONSE, "Fail to parse content, %s", err.c_str());
                 break;
             }
         } else {
+        	// 仅支持JSON/PROTOBUF
             cntl->SetFailed(ERESPONSE,
                             "Unknown content-type=%s when response is not NULL",
                             res_header->content_type().c_str());
@@ -446,6 +485,9 @@ void ProcessHttpResponse(InputMessageBase* msg) {
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
     imsg_guard.reset();
+
+	// 处理响应结果
+	// cid为Socket的correlation_id，同时也是Controller关联的id
     accessor.OnResponse(cid, saved_error);
 }
 
@@ -660,6 +702,10 @@ void PackHttpRequest(butil::IOBuf* buf,
 
     // Store `correlation_id' into Socket since http server
     // may not echo back this field. But we send it anyway.
+
+	// correlation_id可以关联Socket和Controller对象
+	// 当异步客户端收到响应时，可以根据Socket::correlation_id找到对应的请求对象Controller
+	// 从而调用Controller::done的析构函数，完成请求
     accessor.get_sending_socket()->set_correlation_id(correlation_id);
 
 	// 组装http请求

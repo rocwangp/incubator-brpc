@@ -62,6 +62,7 @@ SharedLoadBalancer::~SharedLoadBalancer() {
     }
 }
 
+// 根据load balancer名字找到对应的算法对象
 int SharedLoadBalancer::Init(const char* lb_name) {
     const LoadBalancer* lb = LoadBalancerExtension()->Find(lb_name);
     if (lb == NULL) {
