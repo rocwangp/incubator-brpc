@@ -961,7 +961,9 @@ void Controller::HandleSendFailed() {
 }
 
 // 提交RPC请求，调用Socket::Write
-void Controller::IssueRPC(int64_t start_realtime_us) {
+void Controller::
+
+IssueRPC(int64_t start_realtime_us) {
     _current_call.begin_time_us = start_realtime_us;
     // Clear last error, Don't clear _error_text because we append to it.
     _error_code = 0;

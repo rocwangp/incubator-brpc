@@ -260,7 +260,9 @@ inline TaskGroup* get_task_group(TaskControl* c) {
 
 // 唤醒一个等待在锁上的协程
 int butex_wake(void* arg) {
+	// 根据Butex::value属性指针找到Butex指针
     Butex* b = container_of(static_cast<butil::atomic<int>*>(arg), Butex, value);
+
     ButexWaiter* front = NULL;
     {
     	// 从等待链表中弹出一个ButexBthreadWaiter对象
@@ -272,10 +274,14 @@ int butex_wake(void* arg) {
         front->RemoveFromList();
         front->container.store(NULL, butil::memory_order_relaxed);
     }
+
+	// tid为0表示阻塞的是一个pthread
     if (front->tid == 0) {
         wakeup_pthread(static_cast<ButexPthreadWaiter*>(front));
         return 1;
     }
+
+	// append到waiters中的是ButexBthreadWaiter对象，可以进行指针转换
     ButexBthreadWaiter* bbw = static_cast<ButexBthreadWaiter*>(front);
 
 	// 是否需要sleep
@@ -284,8 +290,11 @@ int butex_wake(void* arg) {
 	// 调度对应的协程(tid)
     TaskGroup* g = tls_task_group;
     if (g) {
+		// 切换到对应的协程去执行，如果协程阻塞在bthread_id_lock_and_reset_range_verbose
+		// 则在while的下次循环可获得锁
         TaskGroup::exchange(&g, bbw->tid);
     } else {
+    	// 选择一个核去运行这个协程
         bbw->control->choose_one_group()->ready_to_run_remote(bbw->tid);
     }
     return 1;

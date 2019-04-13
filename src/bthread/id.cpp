@@ -447,11 +447,14 @@ int bthread_id_lock_and_reset_range_verbose(
             uint32_t expected_ver = *butex;
             meta->mutex.unlock();
             ever_contended = true;
-		// 将当前协程加到这个锁的等待队列中，在unlock函数中会唤醒等待的协程
+			// 将当前协程加到这个锁的等待队列中，在unlock函数中会唤醒等待的协程
             if (bthread::butex_wait(butex, expected_ver, NULL) < 0 &&
                 errno != EWOULDBLOCK && errno != EINTR) {
                 return errno;
             }
+
+			// 被唤醒后重新尝试获取锁
+			// 被唤醒说明其它协程unlock了锁，也就是设置了*butex=meta->first_ver
             meta->mutex.lock();
         } else { // bthread_id_about_to_destroy was called.
             meta->mutex.unlock();
@@ -535,6 +538,7 @@ int bthread_id_join(bthread_id_t id) {
         if (!has_ver) {
             break;
         }
+		
         if (bthread::butex_wait(join_butex, expected_ver, NULL) < 0 &&
             errno != EWOULDBLOCK && errno != EINTR) {
             return errno;
@@ -543,6 +547,7 @@ int bthread_id_join(bthread_id_t id) {
     return 0;
 }
 
+// 尝试上锁
 int bthread_id_trylock(bthread_id_t id, void** pdata) {
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
@@ -555,10 +560,12 @@ int bthread_id_trylock(bthread_id_t id, void** pdata) {
         meta->mutex.unlock();
         return EINVAL;
     }
+	// 如果已经被锁住，直接返回
     if (*butex != meta->first_ver) {
         meta->mutex.unlock();
         return EBUSY;
-    }
+    }
+	// 当前协程上锁后返回
     *butex = meta->locked_ver;
     meta->mutex.unlock();
     if (pdata != NULL) {
@@ -614,6 +621,8 @@ int bthread_id_unlock(bthread_id_t id) {
 		// 解锁后，*butex等于first_vec
         *butex = meta->first_ver;
         meta->mutex.unlock();
+
+		// 如果之前有协程等待在这个锁上面，就去唤醒它
         if (contended) {
 			// 唤醒一个等待的协程
             // We may wake up already-reused id, but that's OK.
